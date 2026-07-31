@@ -302,6 +302,11 @@ osascript() {
 _mole_path_requires_direct_trash "/Applications/Microsoft Word.app"
 ! _mole_path_requires_direct_trash "/Applications/Utilities/Microsoft Word.app"
 ! _mole_path_requires_direct_trash "/Applications/Microsoft Word.app/Contents"
+_mole_path_is_top_level_application_bundle "/Applications/Microsoft Word.app"
+_mole_path_is_top_level_application_bundle "/Applications/Microsoft Word.app/"
+! _mole_path_is_top_level_application_bundle "/Applications/Microsoft Word"
+! _mole_path_is_top_level_application_bundle "/Applications/Utilities/Microsoft Word.app"
+! _mole_path_is_top_level_application_bundle "/ApplicationsX/Microsoft Word.app"
 _mole_move_to_trash "/Applications/Microsoft Word.app" false
 EOF
 
@@ -309,6 +314,187 @@ EOF
     grep -qF "direct:/Applications/Microsoft Word.app:false" "$trace"
     [[ "$(grep -c '^trash:' "$trace" 2> /dev/null || true)" -eq 0 ]] || return 1
     [[ "$(grep -c '^osascript:' "$trace" 2> /dev/null || true)" -eq 0 ]]
+}
+
+@test "downgraded application bundle retries a denied direct move through Finder" {
+    local fake_home="$SANDBOX/home"
+    local victim="$SANDBOX/Microsoft Teams.app"
+    local finder_dest="$SANDBOX/Finder Trash/Microsoft Teams.app"
+    local trace="$SANDBOX/app-management-fallback.log"
+    mkdir -p "$fake_home" "$victim" "$(dirname "$finder_dest")"
+    printf 'payload' > "$victim/data.txt"
+
+    run /bin/bash --noprofile --norc <<EOF
+$(prelude)
+unset MOLE_TEST_TRASH_DIR
+unset MOLE_TEST_NO_AUTH
+export HOME="$fake_home"
+export MOLE_DELETE_MODE=trash
+_mole_privileged_path_has_mutable_ancestor() { return 0; }
+_mole_path_is_top_level_application_bundle() { return 0; }
+mv() {
+    printf 'mv:%s:%s\n' "\$1" "\$2" >> "$trace"
+    printf 'mv: rename %s to %s: Permission denied\n' "\$1" "\$2" >&2
+    return 1
+}
+osascript() {
+    printf 'osascript:%s\n' "\$*" >> "$trace"
+    /bin/mv "\$2" "$finder_dest"
+}
+trash() {
+    printf 'trash:%s\n' "\$*" >> "$trace"
+    return 98
+}
+sudo() {
+    printf 'sudo:%s\n' "\$*" >> "$trace"
+    return 97
+}
+safe_remove() {
+    printf 'safe_remove:%s\n' "\$*" >> "$trace"
+    return 96
+}
+mole_delete "$victim" true
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ ! -e "$victim" ]] || return 1
+    [[ -f "$finder_dest/data.txt" ]] || return 1
+    [[ "$(grep -c '^mv:' "$trace" 2> /dev/null || true)" -eq 1 ]] || return 1
+    [[ "$(grep -c '^osascript:- ' "$trace" 2> /dev/null || true)" -eq 1 ]] || return 1
+    [[ "$(grep -c '^trash:' "$trace" 2> /dev/null || true)" -eq 0 ]] || return 1
+    [[ "$(grep -c '^sudo:' "$trace" 2> /dev/null || true)" -eq 0 ]] || return 1
+    [[ "$(grep -c '^safe_remove:' "$trace" 2> /dev/null || true)" -eq 0 ]] || return 1
+    [ "$(awk -F'\t' 'END { print $4 }' "$MOLE_DELETE_LOG")" = "ok" ]
+}
+
+@test "failed Finder retry reports App Management and preserves the application bundle" {
+    local fake_home="$SANDBOX/home"
+    local victim="$SANDBOX/WhatsApp.app"
+    local trace="$SANDBOX/app-management-failed.log"
+    mkdir -p "$fake_home" "$victim"
+    printf 'payload' > "$victim/data.txt"
+
+    run /bin/bash --noprofile --norc <<EOF
+$(prelude)
+unset MOLE_TEST_TRASH_DIR
+unset MOLE_TEST_NO_AUTH
+export HOME="$fake_home"
+export MOLE_DELETE_MODE=trash
+_mole_privileged_path_has_mutable_ancestor() { return 0; }
+_mole_path_is_top_level_application_bundle() { return 0; }
+mv() {
+    printf 'mv:%s:%s\n' "\$1" "\$2" >> "$trace"
+    printf 'mv: rename %s to %s: Operation not permitted\n' "\$1" "\$2" >&2
+    return 1
+}
+osascript() {
+    printf 'osascript:%s\n' "\$*" >> "$trace"
+    return 1
+}
+trash() {
+    printf 'trash:%s\n' "\$*" >> "$trace"
+    return 98
+}
+sudo() {
+    printf 'sudo:%s\n' "\$*" >> "$trace"
+    return 97
+}
+safe_remove() {
+    printf 'safe_remove:%s\n' "\$*" >> "$trace"
+    return 96
+}
+set +e
+mole_delete "$victim" true
+rc=\$?
+set -e
+printf 'RC=%s\n' "\$rc"
+[[ \$rc -eq \$MOLE_ERR_APP_MANAGEMENT_DENIED ]] || exit 1
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ -f "$victim/data.txt" ]] || return 1
+    [[ "$output" == *"App Management"* ]] || return 1
+    [[ "$output" == *"Finder"* ]] || return 1
+    [[ "$output" != *"Full Disk Access"* ]] || return 1
+    [[ "$output" == *"RC=15"* ]] || return 1
+    [[ "$(grep -c '^mv:' "$trace" 2> /dev/null || true)" -eq 1 ]] || return 1
+    [[ "$(grep -c '^osascript:- ' "$trace" 2> /dev/null || true)" -eq 1 ]] || return 1
+    [[ "$(grep -c '^trash:' "$trace" 2> /dev/null || true)" -eq 0 ]] || return 1
+    [[ "$(grep -c '^sudo:' "$trace" 2> /dev/null || true)" -eq 0 ]] || return 1
+    [[ "$(grep -c '^safe_remove:' "$trace" 2> /dev/null || true)" -eq 0 ]] || return 1
+    [ "$(awk -F'\t' 'END { print $4 }' "$MOLE_DELETE_LOG")" = "app-management-denied" ]
+}
+
+@test "application bundle without a privilege downgrade does not use Finder retry" {
+    local fake_home="$SANDBOX/home"
+    local victim="$SANDBOX/User App.app"
+    local trace="$SANDBOX/no-downgrade-fallback.log"
+    mkdir -p "$fake_home" "$victim"
+
+    run /bin/bash --noprofile --norc <<EOF
+$(prelude)
+unset MOLE_TEST_TRASH_DIR
+unset MOLE_TEST_NO_AUTH
+export HOME="$fake_home"
+export MOLE_DELETE_MODE=trash
+_mole_path_is_top_level_application_bundle() { return 0; }
+mv() {
+    printf 'mv: permission denied\n' >&2
+    return 1
+}
+osascript() {
+    printf 'osascript\n' >> "$trace"
+    return 98
+}
+set +e
+mole_delete "$victim" false
+rc=\$?
+set -e
+printf 'RC=%s\n' "\$rc"
+[[ \$rc -eq \$MOLE_ERR_PRIVACY_DENIED ]] || exit 1
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ -d "$victim" ]] || return 1
+    [[ "$output" == *"RC=14"* ]] || return 1
+    [[ ! -s "$trace" ]] || return 1
+}
+
+@test "downgraded app data keeps the existing privacy error without Finder retry" {
+    local fake_home="$SANDBOX/home"
+    local victim="$fake_home/Library/Containers/com.microsoft.Word"
+    local trace="$SANDBOX/container-no-finder.log"
+    mkdir -p "$victim"
+
+    run /bin/bash --noprofile --norc <<EOF
+$(prelude)
+unset MOLE_TEST_TRASH_DIR
+unset MOLE_TEST_NO_AUTH
+export HOME="$fake_home"
+export MOLE_DELETE_MODE=trash
+export MOLE_UNINSTALL_MODE=1
+_mole_privileged_path_has_mutable_ancestor() { return 0; }
+mv() {
+    printf 'mv: permission denied\n' >&2
+    return 1
+}
+osascript() {
+    printf 'osascript\n' >> "$trace"
+    return 98
+}
+set +e
+mole_delete "$victim" true
+rc=\$?
+set -e
+printf 'RC=%s\n' "\$rc"
+[[ \$rc -eq \$MOLE_ERR_PRIVACY_DENIED ]] || exit 1
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ -d "$victim" ]] || return 1
+    [[ "$output" == *"App Data or Full Disk Access"* ]] || return 1
+    [[ "$output" == *"RC=14"* ]] || return 1
+    [[ ! -s "$trace" ]] || return 1
 }
 
 @test "normal app data uses direct Trash with a unique name and mode 0700" {
@@ -494,6 +680,19 @@ EOF
     [[ "$output" == *"macOS privacy permission denied"* ]] || return 1
     [[ "$output" == *"App Data or Full Disk Access"* ]] || return 1
     [[ "$output" != *"touchid"* ]] || return 1
+    [[ "$output" != *"Touch ID"* ]]
+}
+
+@test "App Management diagnosis recommends Finder without blaming Full Disk Access" {
+    run /bin/bash --noprofile --norc <<EOF
+$(prelude)
+diagnose_removal_failure "\$MOLE_ERR_APP_MANAGEMENT_DENIED" "Microsoft Teams"
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"macOS App Management denied app-bundle removal"* ]] || return 1
+    [[ "$output" == *"Finder"* ]] || return 1
+    [[ "$output" != *"Full Disk Access"* ]] || return 1
     [[ "$output" != *"Touch ID"* ]]
 }
 

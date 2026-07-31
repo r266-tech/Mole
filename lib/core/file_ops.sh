@@ -16,6 +16,7 @@ readonly MOLE_ERR_AUTH_FAILED=11
 readonly MOLE_ERR_READONLY_FS=12
 readonly MOLE_ERR_PROTECTED_PATH=13
 readonly MOLE_ERR_PRIVACY_DENIED=14
+readonly MOLE_ERR_APP_MANAGEMENT_DENIED=15
 
 # Ensure dependencies are loaded
 _MOLE_CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -750,6 +751,7 @@ safe_sudo_remove() {
 mole_delete() {
     local path="$1"
     local needs_sudo="${2:-false}"
+    local sudo_was_downgraded=false
     local mode="${MOLE_DELETE_MODE:-permanent}"
 
     [[ -z "$path" ]] && return 1
@@ -787,6 +789,7 @@ mole_delete() {
         if [[ ${EUID:-0} -ne 0 ]]; then
             debug_log "Downgrading privileged delete below mutable parent: $path"
             needs_sudo=false
+            sudo_was_downgraded=true
         else
             _mole_delete_log "$mode" "unknown" "mutable-parent" "$path"
             debug_log "Refusing privileged delete below mutable parent: $path"
@@ -838,7 +841,7 @@ mole_delete() {
     # fail closed instead of silently switching to permanent removal.
     if [[ "$mode" == "trash" ]]; then
         local trash_rc=0
-        _mole_move_to_trash "$path" "$needs_sudo" || trash_rc=$?
+        _mole_move_to_trash "$path" "$needs_sudo" "$sudo_was_downgraded" || trash_rc=$?
         if [[ $trash_rc -eq 0 ]]; then
             _mole_delete_log "trash" "$size_kb" "ok" "$path"
             log_operation "${MOLE_CURRENT_COMMAND:-uninstall}" "TRASHED" "$path" "${size_kb}KB"
@@ -854,6 +857,17 @@ mole_delete() {
             fi
             debug_log "macOS privacy permission denied while moving to Trash: $path"
             return "$MOLE_ERR_PRIVACY_DENIED"
+        fi
+        if [[ $trash_rc -eq $MOLE_ERR_APP_MANAGEMENT_DENIED ]]; then
+            _mole_delete_log "trash" "$size_kb" "app-management-denied" "$path"
+            log_operation "${MOLE_CURRENT_COMMAND:-uninstall}" "SKIPPED" "$path" "app management denied"
+            if [[ -z "${_MOLE_APP_MANAGEMENT_DENIED_WARNED:-}" ]]; then
+                _MOLE_APP_MANAGEMENT_DENIED_WARNED=1
+                export _MOLE_APP_MANAGEMENT_DENIED_WARNED
+                printf 'Error: macOS blocked app-bundle removal, and Finder could not complete the Trash move. Allow App Management and Finder automation for your terminal in System Settings, or move the app to Trash in Finder, then retry.\n' >&2
+            fi
+            debug_log "macOS app management denied app-bundle removal after Finder fallback: $path"
+            return "$MOLE_ERR_APP_MANAGEMENT_DENIED"
         fi
         _mole_delete_log "trash" "$size_kb" "trash-failed" "$path"
         log_operation "${MOLE_CURRENT_COMMAND:-uninstall}" "SKIPPED" "$path" "trash-failed"
@@ -909,13 +923,18 @@ _mole_path_is_immediate_child_of() {
     [[ -n "$child" && "$child" != */* ]]
 }
 
+_mole_path_is_top_level_application_bundle() {
+    local path="${1%/}"
+    _mole_path_is_immediate_child_of "$path" "/Applications" &&
+        [[ "${path##*/}" == *.app ]]
+}
+
 # Finder and third-party Trash helpers can fail on app bundles and TCC-managed
 # app data even after authentication. Route only these exact one-level targets
 # through the direct, recoverable Trash mover.
 _mole_path_requires_direct_trash() {
     local path="${1%/}"
-    if _mole_path_is_immediate_child_of "$path" "/Applications" &&
-        [[ "${path##*/}" == *.app ]]; then
+    if _mole_path_is_top_level_application_bundle "$path"; then
         return 0
     fi
 
@@ -927,11 +946,31 @@ _mole_path_requires_direct_trash() {
     return 1
 }
 
+_mole_move_with_finder() {
+    local path="$1"
+
+    if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
+        return 1
+    fi
+
+    # Pass the path via argv so special chars (quotes, backslashes) cannot
+    # break out of the quoted AppleScript string.
+    osascript - "$path" > /dev/null 2>&1 << 'APPLESCRIPT'
+on run argv
+    set p to POSIX file (item 1 of argv)
+    tell application "Finder"
+        delete p
+    end tell
+end run
+APPLESCRIPT
+}
+
 # Move a path to the macOS Trash. Test harnesses set MOLE_TEST_TRASH_DIR to
 # redirect the move to a tmpdir, avoiding any Finder/osascript interaction.
 _mole_move_to_trash() {
     local path="$1"
     local needs_sudo="${2:-false}"
+    local sudo_was_downgraded="${3:-false}"
 
     if [[ -n "${MOLE_TEST_TRASH_DIR:-}" ]]; then
         mkdir -p "$MOLE_TEST_TRASH_DIR" 2> /dev/null || return 1
@@ -946,7 +985,7 @@ _mole_move_to_trash() {
     fi
 
     if [[ "$needs_sudo" == "true" ]] || _mole_path_requires_direct_trash "$path"; then
-        _mole_move_path_to_user_trash "$path" "$needs_sudo"
+        _mole_move_path_to_user_trash "$path" "$needs_sudo" "$sudo_was_downgraded"
         return $?
     fi
 
@@ -955,16 +994,8 @@ _mole_move_to_trash() {
         trash "$path" > /dev/null 2>&1 && return 0
     fi
 
-    # AppleScript fallback. Pass the path via argv so special chars (quotes,
-    # backslashes) cannot break out of the quoted string.
-    osascript - "$path" > /dev/null 2>&1 << 'APPLESCRIPT'
-on run argv
-    set p to POSIX file (item 1 of argv)
-    tell application "Finder"
-        delete p
-    end tell
-end run
-APPLESCRIPT
+    # AppleScript fallback.
+    _mole_move_with_finder "$path"
 }
 
 # /Library/Caches is mode 0777 on supported macOS releases, so it cannot anchor a
@@ -1031,6 +1062,7 @@ _mole_create_privileged_trash_stage() {
 _mole_move_path_to_user_trash() {
     local path="$1"
     local needs_sudo="${2:-false}"
+    local sudo_was_downgraded="${3:-false}"
 
     if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
         return 1
@@ -1048,6 +1080,7 @@ _mole_move_path_to_user_trash() {
         if [[ ${EUID:-0} -ne 0 ]]; then
             debug_log "Downgrading Trash move below mutable parent: $path"
             needs_sudo=false
+            sudo_was_downgraded=true
         else
             debug_log "Refusing privileged Trash move below mutable parent: $path"
             return 1
@@ -1200,6 +1233,20 @@ _mole_move_path_to_user_trash() {
         case "$move_output" in
             *"Operation not permitted"* | *"operation not permitted"* | \
                 *"Permission denied"* | *"permission denied"*)
+                if [[ "$sudo_was_downgraded" == "true" ]] &&
+                    _mole_path_is_top_level_application_bundle "$path" &&
+                    [[ -e "$path" || -L "$path" ]]; then
+                    if _mole_move_with_finder "$path"; then
+                        if [[ ! -e "$path" && ! -L "$path" ]]; then
+                            debug_log "Moved App Management-blocked bundle to Trash through Finder: $path"
+                            return 0
+                        fi
+                        debug_log "Finder reported success but left app bundle in place: $path"
+                    else
+                        debug_log "Finder failed to move App Management-blocked bundle to Trash: $path"
+                    fi
+                    return "$MOLE_ERR_APP_MANAGEMENT_DENIED"
+                fi
                 return "$MOLE_ERR_PRIVACY_DENIED"
                 ;;
         esac
@@ -1642,6 +1689,10 @@ diagnose_removal_failure() {
         "$MOLE_ERR_PRIVACY_DENIED")
             reason="macOS privacy permission denied"
             suggestion="Grant App Data or Full Disk Access to your terminal in System Settings"
+            ;;
+        "$MOLE_ERR_APP_MANAGEMENT_DENIED")
+            reason="macOS App Management denied app-bundle removal"
+            suggestion="Allow App Management and Finder automation for your terminal, or move the app to Trash in Finder"
             ;;
         *)
             reason="permission denied"

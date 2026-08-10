@@ -264,6 +264,9 @@ source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 db="$HOME/Library/Messages/chat.db"
 mkdir -p "$(dirname "$db")"
 touch "$db"
+db2="$HOME/Library/Safari/History.db"
+mkdir -p "$(dirname "$db2")"
+touch "$db2"
 pgrep() { return 1; }
 file() { echo "SQLite 3.x database"; }
 # 200 MiB > MOLE_SQLITE_MAX_SIZE (100 MiB).
@@ -345,6 +348,55 @@ EOF
 
 	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
 	[[ "$output" == *"Already optimal for 1 databases"* ]] || return 1
+}
+
+@test "SQLite file size probe failures are reported without aborting" {
+	run env HOME="$HOME/sqlite-size-failure" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+db="$HOME/Library/Messages/chat.db"
+mkdir -p "$(dirname "$db")"
+touch "$db"
+pgrep() { return 1; }
+file() { echo "SQLite 3.x database"; }
+get_file_size() { return 124; }
+should_protect_path() { return 1; }
+execute_optimization sqlite_vacuum
+[[ "$(optimize_outcome_count failed)" == "1" ]] || exit 1
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Failed on 1 databases"* ]] || return 1
+}
+
+@test "SQLite size probe interruption propagates and stops the task" {
+	run env HOME="$HOME/sqlite-size-interrupted" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+db="$HOME/Library/Messages/chat.db"
+mkdir -p "$(dirname "$db")"
+touch "$db"
+db2="$HOME/Library/Safari/History.db"
+mkdir -p "$(dirname "$db2")"
+touch "$db2"
+pgrep() { return 1; }
+file() { echo "SQLite 3.x database"; }
+should_protect_path() { return 1; }
+calls_log="$HOME/size-probe-calls"
+get_file_size() {
+    printf '%s\n' "$1" >> "$calls_log"
+    return 130
+}
+rc=0
+optimize_task_start
+opt_sqlite_vacuum || rc=$?
+[[ "$rc" -eq 130 ]] || exit 1
+[[ "$(wc -l < "$calls_log")" -eq 1 ]] || exit 1
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
 
 @test "SQLite extreme PRAGMA values fail closed without arithmetic overflow" {

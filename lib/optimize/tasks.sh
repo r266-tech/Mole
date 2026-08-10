@@ -45,15 +45,24 @@ optimize_set_database_max_size() {
     amount="${requested%$unit}"
     case "$unit" in
         KiB)
-            optimize_decimal_leq "$amount" 1048576 || { echo "Invalid --database-max-size: maximum is 1GiB." >&2; return 1; }
+            optimize_decimal_leq "$amount" 1048576 || {
+                echo "Invalid --database-max-size: maximum is 1GiB." >&2
+                return 1
+            }
             bytes=$((amount * 1024))
             ;;
         MiB)
-            optimize_decimal_leq "$amount" 1024 || { echo "Invalid --database-max-size: maximum is 1GiB." >&2; return 1; }
+            optimize_decimal_leq "$amount" 1024 || {
+                echo "Invalid --database-max-size: maximum is 1GiB." >&2
+                return 1
+            }
             bytes=$((amount * 1048576))
             ;;
         GiB)
-            optimize_decimal_leq "$amount" 1 || { echo "Invalid --database-max-size: maximum is 1GiB." >&2; return 1; }
+            optimize_decimal_leq "$amount" 1 || {
+                echo "Invalid --database-max-size: maximum is 1GiB." >&2
+                return 1
+            }
             bytes="$MOLE_SQLITE_HARD_MAX_SIZE"
             ;;
     esac
@@ -74,7 +83,7 @@ optimize_sqlite_retry_size() {
     local size="${1:-0}" retry
     [[ "$size" =~ ^[1-9][0-9]*$ ]] || return 1
     awk -v size="$size" -v limit="$MOLE_SQLITE_HARD_MAX_SIZE" 'BEGIN { exit !(size + 0 <= limit + 0) }' || return 1
-    retry=$(( (size + 1048575) / 1048576 ))
+    retry=$(((size + 1048575) / 1048576))
     ((retry < 100)) && retry=100
     ((retry > 1024)) && return 1
     echo "${retry}MiB"
@@ -715,11 +724,17 @@ opt_sqlite_vacuum() {
                 *) continue ;;
             esac
 
-            local file_size
-            file_size=$(get_file_size "$db_file")
-            if [[ ! "$file_size" =~ ^[0-9]+$ ]]; then
+            local file_size="" size_status=0
+            file_size=$(get_file_size "$db_file") || size_status=$?
+            if [[ $size_status -ne 0 || ! "$file_size" =~ ^[0-9]+$ ]]; then
+                if [[ $size_status -eq 130 ]]; then
+                    if [[ "$spinner_started" == "true" ]]; then
+                        stop_inline_spinner
+                    fi
+                    return 130
+                fi
                 failed=$((failed + 1))
-                optimize_sqlite_log "$db_file" "FAILED" "0" "0" "size_probe"
+                optimize_sqlite_log "$db_file" "FAILED" "0" "0" "size_probe status=$size_status"
                 continue
             fi
 

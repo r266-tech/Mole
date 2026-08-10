@@ -490,7 +490,7 @@ run_with_timeout() {
 }
 sqlite3() {
     case "$2" in
-        "PRAGMA page_count; PRAGMA freelist_count;") printf '100\n10\n' ;;
+        "PRAGMA page_count; PRAGMA freelist_count; PRAGMA page_size;") printf '100\n10\n4096\n' ;;
         "PRAGMA integrity_check;") echo "ok" ;;
         "VACUUM;") [[ "$1" == *"chat.db" ]] ;;
     esac
@@ -520,8 +520,8 @@ file() { echo "SQLite 3.x database"; }
 get_file_size() { echo 1; }
 run_with_timeout() {
     shift
-    if [[ "$3" == "PRAGMA page_count; PRAGMA freelist_count;" ]]; then
-        printf '100\n10\n'
+    if [[ "$3" == "PRAGMA page_count; PRAGMA freelist_count; PRAGMA page_size;" ]]; then
+        printf '100\n10\n4096\n'
         return 0
     fi
     return 7
@@ -548,6 +548,7 @@ touch "$db"
 pgrep() { return 1; }
 file() { echo "SQLite 3.x database"; }
 get_file_size() { echo $((MOLE_SQLITE_MAX_SIZE + 1)); }
+run_with_timeout() { printf '100000\n10000\n4096\n'; }
 export -f pgrep file get_file_size
 
 execute_optimization sqlite_vacuum
@@ -555,7 +556,81 @@ execute_optimization sqlite_vacuum
 EOF
 
 	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
-	[[ "$output" == *"Skipped 1 databases over the 100 MB safety limit"* ]] || return 1
+	[[ "$output" == *"Skipped 1 databases over the 100MiB safety limit"* ]] || return 1
+}
+
+@test "mo optimize accepts the bounded database size option at the entrypoint" {
+	run env HOME="$HOME" MOLE_TEST_NO_AUTH=1 "$PROJECT_ROOT/bin/optimize.sh" --database-max-size 300MiB --help
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"--database-max-size SIZE"* ]] || return 1
+	[[ "$output" == *"maximum 1GiB"* ]] || return 1
+}
+
+@test "mo optimize rejects invalid database size options at the entrypoint" {
+	local value
+	for value in "" 0MiB 300 2GiB -1MiB; do
+		if [[ -n "$value" ]]; then
+			run env HOME="$HOME" MOLE_TEST_NO_AUTH=1 "$PROJECT_ROOT/bin/optimize.sh" --database-max-size "$value"
+		else
+			run env HOME="$HOME" MOLE_TEST_NO_AUTH=1 "$PROJECT_ROOT/bin/optimize.sh" --database-max-size
+		fi
+		[ "$status" -ne 0 ] || { echo "accepted invalid value: ${value:-missing}"; return 1; }
+		[[ "$output" == *"Use 'mo optimize --help'"* ]] || return 1
+	done
+}
+
+@test "mo optimize rejects duplicate database size options at the entrypoint" {
+	run env HOME="$HOME" MOLE_TEST_NO_AUTH=1 "$PROJECT_ROOT/bin/optimize.sh" \
+		--database-max-size 200MiB --database-max-size 300MiB
+
+	[ "$status" -ne 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Use 'mo optimize --help'"* ]] || return 1
+}
+
+@test "mo optimize propagates database size option through the curated dispatch" {
+	run env HOME="$HOME/sqlite-entrypoint" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/optimize.sh"
+
+generate_health_json() { printf '%s\n' '{"memory_used_gb":0,"optimizations":{}}'; }
+show_system_health() { :; }
+run_optimize_diagnostics() { :; }
+load_whitelist() { CURRENT_WHITELIST_PATTERNS=(); }
+announce_action() { :; }
+
+# Keep the catalog's readonly action list intact while exercising main's
+# argument parsing and dispatch path. Only the curated database task runs its
+# real handler; the other catalog entries complete as unchanged.
+execute_optimization() {
+    local action="$1"
+    optimize_task_start
+    if [[ "$action" == "sqlite_vacuum" ]]; then
+        opt_sqlite_vacuum
+    else
+        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_UNCHANGED"
+    fi
+    optimize_task_finish "$action"
+}
+
+db="$HOME/Library/Messages/chat.db"
+mkdir -p "$(dirname "$db")"
+touch "$db"
+pgrep() { return 1; }
+file() { echo "SQLite 3.x database"; }
+get_file_size() { echo 209715200; }
+should_protect_path() { return 1; }
+run_with_timeout() {
+    [[ "$4" == "PRAGMA page_count; PRAGMA freelist_count; PRAGMA page_size;" ]] || return 64
+    printf '100000\n10000\n4096\n'
+}
+
+main --database-max-size 300MiB --dry-run --debug
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Would apply 1 optimizations"* ]] || return 1
+	[[ "$output" != *"Skipped 1 databases over the 100MiB safety limit"* ]] || return 1
 }
 
 @test "optimize does not auto-fix Gatekeeper anymore" {

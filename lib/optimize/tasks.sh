@@ -16,7 +16,107 @@ source "$_MOLE_OPTIMIZE_TASKS_DIR/outcomes.sh"
 # Config constants (override via env).
 readonly MOLE_TM_THIN_TIMEOUT=180
 readonly MOLE_TM_THIN_VALUE=9999999999
-readonly MOLE_SQLITE_MAX_SIZE=104857600 # 100MB
+readonly MOLE_SQLITE_DEFAULT_MAX_SIZE=104857600
+readonly MOLE_SQLITE_HARD_MAX_SIZE=1073741824
+readonly MOLE_SQLITE_ARITH_MAX=9000000000000000000
+MOLE_SQLITE_MAX_SIZE="$MOLE_SQLITE_DEFAULT_MAX_SIZE"
+MOLE_SQLITE_MAX_SIZE_DISPLAY="100MiB"
+
+optimize_decimal_leq() {
+    local value="$1" limit="$2" value_length limit_length
+    value_length=${#value}
+    limit_length=${#limit}
+    if ((value_length < limit_length)); then
+        return 0
+    fi
+    if ((value_length > limit_length)); then
+        return 1
+    fi
+    [[ "$value" == "$limit" || "$value" < "$limit" ]]
+}
+
+optimize_set_database_max_size() {
+    local requested="${1:-}" amount unit bytes
+    [[ "$requested" =~ ^[1-9][0-9]*(KiB|MiB|GiB)$ ]] || {
+        echo "Invalid --database-max-size: use a positive value with units up to 1GiB." >&2
+        return 1
+    }
+    unit="${requested##*[0-9]}"
+    amount="${requested%$unit}"
+    case "$unit" in
+        KiB)
+            optimize_decimal_leq "$amount" 1048576 || { echo "Invalid --database-max-size: maximum is 1GiB." >&2; return 1; }
+            bytes=$((amount * 1024))
+            ;;
+        MiB)
+            optimize_decimal_leq "$amount" 1024 || { echo "Invalid --database-max-size: maximum is 1GiB." >&2; return 1; }
+            bytes=$((amount * 1048576))
+            ;;
+        GiB)
+            optimize_decimal_leq "$amount" 1 || { echo "Invalid --database-max-size: maximum is 1GiB." >&2; return 1; }
+            bytes="$MOLE_SQLITE_HARD_MAX_SIZE"
+            ;;
+    esac
+    MOLE_SQLITE_MAX_SIZE="$bytes"
+    MOLE_SQLITE_MAX_SIZE_DISPLAY="$requested"
+    export MOLE_SQLITE_MAX_SIZE MOLE_SQLITE_MAX_SIZE_DISPLAY
+}
+
+optimize_sqlite_timeout() {
+    local base="$1" cap="$2" timeout
+    timeout=$((base * MOLE_SQLITE_MAX_SIZE / MOLE_SQLITE_DEFAULT_MAX_SIZE))
+    ((timeout < base)) && timeout="$base"
+    ((timeout > cap)) && timeout="$cap"
+    echo "$timeout"
+}
+
+optimize_sqlite_retry_size() {
+    local size="${1:-0}" retry
+    [[ "$size" =~ ^[1-9][0-9]*$ ]] || return 1
+    awk -v size="$size" -v limit="$MOLE_SQLITE_HARD_MAX_SIZE" 'BEGIN { exit !(size + 0 <= limit + 0) }' || return 1
+    retry=$(( (size + 1048575) / 1048576 ))
+    ((retry < 100)) && retry=100
+    ((retry > 1024)) && return 1
+    echo "${retry}MiB"
+}
+
+optimize_sqlite_log() {
+    log_operation "optimize" "$2" "$1" "original_size=$3 final_size=$4${5:+ $5}"
+}
+
+optimize_get_free_space_kb_for_path() {
+    local db_path="$1" target available_kb df_output df_status=0
+    target=$(dirname -- "$db_path")
+    df_output=$(LC_ALL=C run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" df -Pk "$target" 2> /dev/null) || df_status=$?
+    [[ $df_status -eq 0 ]] || return "$df_status"
+    available_kb=$(printf '%s\n' "$df_output" | awk 'NR==2 {print $4}')
+    [[ "$available_kb" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$available_kb"
+}
+
+optimize_sqlite_reclaimable_bytes() {
+    local freelist_count="$1" page_size="$2" file_size="$3"
+    [[ "$freelist_count" =~ ^[0-9]+$ && "$page_size" =~ ^[0-9]+$ && "$file_size" =~ ^[0-9]+$ ]] || return 1
+    LC_ALL=C awk -v value="$freelist_count" -v limit="$MOLE_SQLITE_ARITH_MAX" 'BEGIN { exit !(value + 0 <= limit + 0) }' || return 1
+    LC_ALL=C awk -v value="$page_size" 'BEGIN { exit !(value + 0 <= 65536) }' || return 1
+    if ((freelist_count > MOLE_SQLITE_ARITH_MAX / page_size)); then
+        printf '%s\n' "$MOLE_SQLITE_ARITH_MAX"
+    else
+        printf '%s\n' "$((freelist_count * page_size))"
+    fi
+}
+
+optimize_sqlite_probe_metrics_valid() {
+    local page_count="$1" freelist_count="$2" page_size="$3"
+    LC_ALL=C awk -v pages="$page_count" -v freelist="$freelist_count" -v size="$page_size" \
+        -v max="$MOLE_SQLITE_ARITH_MAX" \
+        'BEGIN {
+            exit !(pages ~ /^[0-9]+$/ && freelist ~ /^[0-9]+$/ && size ~ /^[0-9]+$/ &&
+                pages + 0 > 0 && freelist + 0 <= pages + 0 &&
+                pages + 0 <= max + 0 && freelist + 0 <= max + 0 &&
+                size + 0 > 0 && size + 0 <= 65536)
+        }'
+}
 
 # Dry-run aware output.
 opt_msg() {
@@ -601,6 +701,7 @@ opt_sqlite_vacuum() {
     # Paths held back only by the size ceiling (issue #1367): never claim
     # "all already optimized" when this list is non-empty.
     local -a policy_skipped_paths=()
+    local -a policy_skipped_reclaimable=()
 
     for pattern in "${db_paths[@]}"; do
         while IFS= read -r db_file; do
@@ -614,62 +715,104 @@ opt_sqlite_vacuum() {
                 *) continue ;;
             esac
 
-            # Skip large DBs (>100MB).
             local file_size
             file_size=$(get_file_size "$db_file")
-            if [[ "$file_size" -gt "$MOLE_SQLITE_MAX_SIZE" ]]; then
-                policy_skipped=$((policy_skipped + 1))
-                policy_skipped_paths+=("$db_file")
+            if [[ ! "$file_size" =~ ^[0-9]+$ ]]; then
+                failed=$((failed + 1))
+                optimize_sqlite_log "$db_file" "FAILED" "0" "0" "size_probe"
                 continue
             fi
 
-            # Skip if freelist is tiny (already compact).
-            local page_info=""
-            local page_status=0
-            page_info=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" sqlite3 "$db_file" "PRAGMA page_count; PRAGMA freelist_count;" 2> /dev/null) || page_status=$?
+            # Probe reclaimability before applying the configured size policy.
+            local page_info="" page_status=0 probe_timeout
+            probe_timeout=$(optimize_sqlite_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" 30)
+            page_info=$(run_with_timeout "$probe_timeout" sqlite3 "$db_file" "PRAGMA page_count; PRAGMA freelist_count; PRAGMA page_size;" 2> /dev/null) || page_status=$?
             if [[ $page_status -ne 0 ]]; then
                 failed=$((failed + 1))
+                optimize_sqlite_log "$db_file" "FAILED" "$file_size" "$file_size" "probe status=$page_status"
                 continue
             fi
-            local page_count=""
-            local freelist_count=""
+            local page_count="" freelist_count="" page_size=""
             page_count="${page_info%%$'\n'*}"
             if [[ "$page_info" == *$'\n'* ]]; then
                 freelist_count="${page_info#*$'\n'}"
                 freelist_count="${freelist_count%%$'\n'*}"
+                page_size="${page_info#*$'\n'}"
+                page_size="${page_size#*$'\n'}"
+                page_size="${page_size%%$'\n'*}"
             fi
-            if [[ "$page_count" =~ ^[0-9]+$ && "$freelist_count" =~ ^[0-9]+$ && "$page_count" -gt 0 ]]; then
-                if ((freelist_count * 100 < page_count * 5)); then
-                    already_optimal=$((already_optimal + 1))
+            if ! optimize_sqlite_probe_metrics_valid "$page_count" "$freelist_count" "$page_size"; then
+                failed=$((failed + 1))
+                optimize_sqlite_log "$db_file" "FAILED" "$file_size" "$file_size" "probe_data"
+                continue
+            fi
+            if awk -v freelist="$freelist_count" -v pages="$page_count" \
+                'BEGIN { exit !(freelist + 0 < pages + 0 && freelist * 100 < pages * 5) }'; then
+                already_optimal=$((already_optimal + 1))
+                optimize_sqlite_log "$db_file" "UNCHANGED" "$file_size" "$file_size" "already_optimal"
+                continue
+            fi
+            if [[ "$file_size" -gt "$MOLE_SQLITE_MAX_SIZE" ]]; then
+                local reclaimable_bytes
+                reclaimable_bytes=$(optimize_sqlite_reclaimable_bytes "$freelist_count" "$page_size" "$file_size" 2> /dev/null) || {
+                    failed=$((failed + 1))
+                    optimize_sqlite_log "$db_file" "FAILED" "$file_size" "$file_size" "reclaimable_probe"
                     continue
-                fi
+                }
+                policy_skipped=$((policy_skipped + 1))
+                policy_skipped_paths+=("$db_file")
+                policy_skipped_reclaimable+=("$reclaimable_bytes")
+                optimize_sqlite_log "$db_file" "SKIPPED" "$file_size" "$file_size" "size_limit=$MOLE_SQLITE_MAX_SIZE_DISPLAY"
+                continue
             fi
 
             # Verify integrity before VACUUM.
             if [[ "${MOLE_DRY_RUN:-0}" != "1" ]]; then
-                local integrity_check=""
-                local integrity_status=0
-                integrity_check=$(run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" sqlite3 "$db_file" "PRAGMA integrity_check;" 2> /dev/null) || integrity_status=$?
+                local integrity_check="" integrity_status=0 integrity_timeout
+                integrity_timeout=$(optimize_sqlite_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" 60)
+                integrity_check=$(run_with_timeout "$integrity_timeout" sqlite3 "$db_file" "PRAGMA integrity_check;" 2> /dev/null) || integrity_status=$?
 
                 if [[ $integrity_status -ne 0 || "$integrity_check" != "ok" ]]; then
                     failed=$((failed + 1))
+                    optimize_sqlite_log "$db_file" "FAILED" "$file_size" "$file_size" "integrity"
+                    continue
+                fi
+                local free_space_kb free_space_status=0
+                free_space_kb=$(optimize_get_free_space_kb_for_path "$db_file" 2> /dev/null) || free_space_status=$?
+                if [[ $free_space_status -ne 0 ]]; then
+                    echo -e "  ${YELLOW}${ICON_WARNING}${NC} Unable to verify temporary space for ${db_file/#$HOME/~}"
+                    failed=$((failed + 1))
+                    optimize_sqlite_log "$db_file" "FAILED" "$file_size" "$file_size" "temporary_space_probe status=$free_space_status"
+                    continue
+                fi
+                if ! awk -v free="$free_space_kb" -v size="$file_size" \
+                    'BEGIN { exit !(free + 0 >= (size * 2 + 1023) / 1024) }'; then
+                    echo -e "  ${YELLOW}${ICON_WARNING}${NC} Insufficient temporary space for ${db_file/#$HOME/~}"
+                    failed=$((failed + 1))
+                    optimize_sqlite_log "$db_file" "FAILED" "$file_size" "$file_size" "insufficient_temporary_space"
                     continue
                 fi
             fi
 
             local exit_code=0
             if [[ "${MOLE_DRY_RUN:-0}" != "1" ]]; then
-                run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" sqlite3 "$db_file" "VACUUM;" 2> /dev/null || exit_code=$?
+                local vacuum_timeout
+                vacuum_timeout=$(optimize_sqlite_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" 120)
+                run_with_timeout "$vacuum_timeout" sqlite3 "$db_file" "VACUUM;" 2> /dev/null || exit_code=$?
 
                 if [[ $exit_code -eq 0 ]]; then
                     vacuumed=$((vacuumed + 1))
+                    optimize_sqlite_log "$db_file" "REBUILT" "$file_size" "$(get_file_size "$db_file")" "vacuum"
                 elif [[ $exit_code -eq 124 ]]; then
                     timed_out=$((timed_out + 1))
+                    optimize_sqlite_log "$db_file" "FAILED" "$file_size" "$file_size" "timeout"
                 else
                     failed=$((failed + 1))
+                    optimize_sqlite_log "$db_file" "FAILED" "$file_size" "$file_size" "vacuum"
                 fi
             else
                 vacuumed=$((vacuumed + 1))
+                optimize_sqlite_log "$db_file" "DRY_RUN" "$file_size" "$file_size" "would_rebuild"
             fi
         done < <(compgen -G "$pattern" || true)
     done
@@ -699,16 +842,22 @@ opt_sqlite_vacuum() {
     fi
 
     if [[ $policy_skipped -gt 0 ]]; then
-        opt_msg "Skipped $policy_skipped databases over the 100 MB safety limit"
-        local skipped_path skipped_size skipped_display
-        for skipped_path in "${policy_skipped_paths[@]}"; do
+        opt_msg "Skipped $policy_skipped databases over the ${MOLE_SQLITE_MAX_SIZE_DISPLAY} safety limit"
+        local skipped_path skipped_size skipped_display skipped_reclaimable retry_size index
+        for ((index = 0; index < ${#policy_skipped_paths[@]}; index++)); do
+            skipped_path="${policy_skipped_paths[$index]}"
             skipped_size=$(get_file_size "$skipped_path" 2> /dev/null || echo 0)
             if [[ "$skipped_size" =~ ^[0-9]+$ && "$skipped_size" -gt 0 ]]; then
                 skipped_display=$(bytes_to_human "$skipped_size")
             else
                 skipped_display="unknown size"
             fi
-            echo -e "  ${GRAY}${ICON_SUBLIST}${NC} ${skipped_path/#$HOME/~} · ${skipped_display}"
+            echo -e "  ${GRAY}${ICON_SUBLIST}${NC} ${skipped_path/#$HOME/~} | ${skipped_display}"
+            skipped_reclaimable="${policy_skipped_reclaimable[$index]:-0}"
+            echo -e "  ${GRAY}Reclaimable: $(bytes_to_human "$skipped_reclaimable") | limit: ${MOLE_SQLITE_MAX_SIZE_DISPLAY}${NC}"
+            if retry_size=$(optimize_sqlite_retry_size "$skipped_size"); then
+                echo -e "  ${GRAY}Retry: mo optimize --database-max-size ${retry_size}${NC}"
+            fi
         done
     fi
 

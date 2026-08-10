@@ -193,15 +193,25 @@ main() {
     # Set current command for operation logging
     export MOLE_CURRENT_COMMAND="optimize"
 
-    local health_json
-    for arg in "$@"; do
+    local health_json database_max_size_seen=0
+    while [[ $# -gt 0 ]]; do
+        local arg="$1"
         case "$arg" in
             "--help" | "-h")
                 show_optimize_help
+                echo "  --database-max-size SIZE  Allow curated SQLite databases up to SIZE (maximum 1GiB)"
                 exit 0
                 ;;
             "--debug")
                 export MO_DEBUG=1
+                ;;
+            "--database-max-size")
+                shift
+                if [[ "$database_max_size_seen" -eq 1 || $# -eq 0 ]] || ! optimize_set_database_max_size "$1"; then
+                    echo "Use 'mo optimize --help' for supported options." >&2
+                    exit 1
+                fi
+                database_max_size_seen=1
                 ;;
             "--dry-run")
                 export MOLE_DRY_RUN=1
@@ -216,6 +226,7 @@ main() {
                 exit 1
                 ;;
         esac
+        shift
     done
 
     log_operation_session_start "optimize"
@@ -317,4 +328,6 @@ main() {
     optimize_outcomes_succeeded
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

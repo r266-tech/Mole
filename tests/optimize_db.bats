@@ -236,10 +236,13 @@ get_file_size() { echo 1024; }
 should_protect_path() { return 1; }
 run_with_timeout() {
     case "$4" in
-        "PRAGMA page_count; PRAGMA freelist_count;") printf '100\n10\n' ;;
+        "PRAGMA page_count; PRAGMA freelist_count; PRAGMA page_size;") printf '100\n10\n4096\n' ;;
         "PRAGMA integrity_check;") echo "ok" ;;
         "VACUUM;") echo "VACUUM_CALLED" ;;
-        *) return 64 ;;
+        *)
+            [[ "$2" == "df" ]] || return 64
+            printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/mock 2000000 100000 1900000 5%% /\n'
+            ;;
     esac
 }
 
@@ -267,7 +270,7 @@ file() { echo "SQLite 3.x database"; }
 get_file_size() { echo 209715200; }
 should_protect_path() { return 1; }
 bytes_to_human() { echo "200.0MB"; }
-run_with_timeout() { echo "UNEXPECTED_SQLITE"; return 0; }
+run_with_timeout() { printf '100000\n10000\n4096\n'; }
 
 execute_optimization sqlite_vacuum
 EOF
@@ -277,8 +280,128 @@ EOF
 		return 1
 	}
 	[[ "$output" == *"No databases compacted"* ]] || return 1
-	[[ "$output" == *"100 MB safety limit"* ]] || return 1
+	[[ "$output" == *"100MiB safety limit"* ]] || return 1
 	[[ "$output" == *"Messages/chat.db"* ]] || return 1
 	[[ "$output" != *"All databases already optimized"* ]] || return 1
 	[[ "$output" != *"UNEXPECTED_SQLITE"* ]] || return 1
+}
+
+@test "SQLite size override is bounded and unit-bearing" {
+	run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+optimize_set_database_max_size 300MiB
+[[ "$MOLE_SQLITE_MAX_SIZE" -eq 314572800 ]] || exit 1
+[[ "$MOLE_SQLITE_MAX_SIZE_DISPLAY" == "300MiB" ]] || exit 1
+for value in 0MiB 300 2GiB -1MiB 999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999KiB; do
+    if optimize_set_database_max_size "$value"; then
+        exit 1
+    fi
+done
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "SQLite size override allows a reclaimable large curated database" {
+	run env HOME="$HOME/sqlite-opt-in" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+db="$HOME/Library/Messages/chat.db"
+mkdir -p "$(dirname "$db")"
+touch "$db"
+optimize_set_database_max_size 300MiB
+pgrep() { return 1; }
+file() { echo "SQLite 3.x database"; }
+get_file_size() { echo 209715200; }
+should_protect_path() { return 1; }
+run_with_timeout() { printf '100000\n10000\n4096\n'; }
+execute_optimization sqlite_vacuum
+[[ "$(optimize_outcome_count applied)" == "1" ]] || exit 1
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Optimized 1 databases"* ]] || return 1
+}
+
+@test "SQLite compact large database is classified before size policy" {
+	run env HOME="$HOME/sqlite-compact-large" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+db="$HOME/Library/Messages/chat.db"
+mkdir -p "$(dirname "$db")"
+touch "$db"
+pgrep() { return 1; }
+file() { echo "SQLite 3.x database"; }
+get_file_size() { echo 209715200; }
+should_protect_path() { return 1; }
+run_with_timeout() { printf '100000\n100\n4096\n'; }
+execute_optimization sqlite_vacuum
+[[ "$(optimize_outcome_count unchanged)" == "1" ]] || exit 1
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Already optimal for 1 databases"* ]] || return 1
+}
+
+@test "SQLite extreme PRAGMA values fail closed without arithmetic overflow" {
+	run env HOME="$HOME/sqlite-extreme" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+db="$HOME/Library/Messages/chat.db"
+mkdir -p "$(dirname "$db")"
+touch "$db"
+pgrep() { return 1; }
+file() { echo "SQLite 3.x database"; }
+get_file_size() { echo 209715200; }
+should_protect_path() { return 1; }
+run_with_timeout() { printf '1\n999999999999999999999\n4096\n'; }
+execute_optimization sqlite_vacuum
+[[ "$(optimize_outcome_count failed)" == "1" ]] || exit 1
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Failed on 1 databases"* ]] || return 1
+}
+
+@test "SQLite temporary-space probe failures are reported separately" {
+	local mode
+	for mode in timeout malformed low; do
+		run env HOME="$HOME/sqlite-space-$mode" PROJECT_ROOT="$PROJECT_ROOT" SPACE_MODE="$mode" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+db="$HOME/Library/Messages/chat.db"
+mkdir -p "$(dirname "$db")"
+touch "$db"
+pgrep() { return 1; }
+file() { echo "SQLite 3.x database"; }
+get_file_size() { echo 1024; }
+should_protect_path() { return 1; }
+run_with_timeout() {
+    case "$4" in
+        "PRAGMA page_count; PRAGMA freelist_count; PRAGMA page_size;") printf '100\n10\n4096\n' ;;
+        "PRAGMA integrity_check;") echo ok ;;
+        *)
+            if [[ "$SPACE_MODE" == timeout ]]; then return 124; fi
+            if [[ "$SPACE_MODE" == malformed ]]; then printf 'bad\n'; return 0; fi
+            printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/mock 2000 1999 1 99%% /\n'
+            ;;
+    esac
+}
+execute_optimization sqlite_vacuum
+[[ "$(optimize_outcome_count failed)" == "1" ]] || exit 1
+EOF
+
+		[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+		if [[ "$mode" == low ]]; then
+			[[ "$output" == *"Insufficient temporary space"* ]] || return 1
+		else
+			[[ "$output" == *"Unable to verify temporary space"* ]] || return 1
+		fi
+	done
 }

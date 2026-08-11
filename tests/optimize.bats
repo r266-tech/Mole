@@ -589,7 +589,7 @@ EOF
 }
 
 @test "mo optimize propagates database size option through the curated dispatch" {
-	run env HOME="$HOME/sqlite-entrypoint" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+	run env HOME="$HOME/sqlite-entrypoint" PROJECT_ROOT="$PROJECT_ROOT" NO_COLOR=1 /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/bin/optimize.sh"
 
@@ -620,11 +620,27 @@ pgrep() { return 1; }
 file() { echo "SQLite 3.x database"; }
 get_file_size() { echo 209715200; }
 should_protect_path() { return 1; }
-sqlite3() { :; }
+bc() { :; }
+sqlite3() {
+    local sql="${2:-}"
+    case "$sql" in
+        "PRAGMA page_count; PRAGMA freelist_count; PRAGMA page_size;")
+            printf '100000\n10000\n4096\n'
+            ;;
+        "PRAGMA integrity_check;") printf 'ok\n' ;;
+        "VACUUM;") : ;;
+        *) : ;;
+    esac
+}
 run_with_timeout() {
     local sql="${4:-}"
-    [[ "$sql" == "PRAGMA page_count; PRAGMA freelist_count; PRAGMA page_size;" ]] || return 64
-    printf '100000\n10000\n4096\n'
+    case "$sql" in
+        "PRAGMA page_count; PRAGMA freelist_count; PRAGMA page_size;")
+            printf '100000\n10000\n4096\n'
+            ;;
+        "PRAGMA integrity_check;" | "VACUUM;") : ;;
+        *) : ;;
+    esac
 }
 
 main --database-max-size 300MiB --dry-run --debug

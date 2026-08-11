@@ -621,7 +621,8 @@ file() { echo "SQLite 3.x database"; }
 get_file_size() { echo 209715200; }
 should_protect_path() { return 1; }
 run_with_timeout() {
-    [[ "$4" == "PRAGMA page_count; PRAGMA freelist_count; PRAGMA page_size;" ]] || return 64
+    local sql="${4:-}"
+    [[ "$sql" == "PRAGMA page_count; PRAGMA freelist_count; PRAGMA page_size;" ]] || return 64
     printf '100000\n10000\n4096\n'
 }
 

@@ -36,29 +36,30 @@ optimize_decimal_leq() {
 }
 
 optimize_set_database_max_size() {
-    local requested="${1:-}" amount unit bytes
+    local requested="${1:-}" amount bytes
     [[ "$requested" =~ ^[1-9][0-9]*(KiB|MiB|GiB)$ ]] || {
         echo "Invalid --database-max-size: use a positive value with units up to 1GiB." >&2
         return 1
     }
-    unit="${requested##*[0-9]}"
-    amount="${requested%$unit}"
-    case "$unit" in
-        KiB)
+    case "$requested" in
+        *KiB)
+            amount="${requested%KiB}"
             optimize_decimal_leq "$amount" 1048576 || {
                 echo "Invalid --database-max-size: maximum is 1GiB." >&2
                 return 1
             }
             bytes=$((amount * 1024))
             ;;
-        MiB)
+        *MiB)
+            amount="${requested%MiB}"
             optimize_decimal_leq "$amount" 1024 || {
                 echo "Invalid --database-max-size: maximum is 1GiB." >&2
                 return 1
             }
             bytes=$((amount * 1048576))
             ;;
-        GiB)
+        *GiB)
+            amount="${requested%GiB}"
             optimize_decimal_leq "$amount" 1 || {
                 echo "Invalid --database-max-size: maximum is 1GiB." >&2
                 return 1

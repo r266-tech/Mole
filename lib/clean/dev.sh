@@ -2628,11 +2628,13 @@ _resolve_simctl_developer_dir() {
     fi
 
     local selected_developer_dir=""
+    local selected_is_clt=false
     if command -v xcode-select > /dev/null 2>&1; then
         selected_developer_dir=$(xcode-select -p 2> /dev/null || true)
     fi
     case "$selected_developer_dir" in
         /Library/Developer/CommandLineTools | /Library/Developer/CommandLineTools/)
+            selected_is_clt=true
             ;;
         "")
             return 1
@@ -2650,6 +2652,7 @@ _resolve_simctl_developer_dir() {
 
     local -a candidates=()
     local app_root candidate_app candidate_developer_dir
+    local xcode_app_found=false
     local nullglob_was_set=0
     shopt -q nullglob && nullglob_was_set=1
     shopt -s nullglob
@@ -2657,6 +2660,7 @@ _resolve_simctl_developer_dir() {
         [[ -d "$app_root" ]] || continue
         for candidate_app in "$app_root"/Xcode*.app; do
             [[ -d "$candidate_app" ]] || continue
+            xcode_app_found=true
             candidate_developer_dir="$candidate_app/Contents/Developer"
             if _simctl_developer_dir_is_usable "$candidate_developer_dir"; then
                 candidates+=("$candidate_developer_dir")
@@ -2665,6 +2669,12 @@ _resolve_simctl_developer_dir() {
     done
     if [[ $nullglob_was_set -eq 0 ]]; then
         shopt -u nullglob
+    fi
+
+    if [[ "$selected_is_clt" == true && "$xcode_app_found" == false ]]; then
+        _MOLE_SIMCTL_RESOLUTION_STATUS="clt-only"
+        debug_log "Standalone Command Line Tools selected; no Xcode app is installed"
+        return 1
     fi
 
     if [[ ${#candidates[@]} -eq 1 ]]; then
@@ -2736,6 +2746,8 @@ clean_dev_mobile() {
         elif [[ "$_MOLE_SIMCTL_RESOLUTION_STATUS" == "explicit-invalid" ]]; then
             echo -e "  ${GRAY}${ICON_WARNING}${NC} Xcode unavailable simulators · DEVELOPER_DIR has no simctl"
             note_activity
+        elif [[ "$_MOLE_SIMCTL_RESOLUTION_STATUS" == "clt-only" ]]; then
+            debug_log "Skipping unavailable simulator cleanup without a full Xcode installation"
         elif [[ "$_MOLE_SIMCTL_RESOLUTION_STATUS" == "ready" ]]; then
             debug_log "Checking for unavailable Xcode simulators"
             debug_log "Resolved simctl DEVELOPER_DIR: $_MOLE_SIMCTL_DEVELOPER_DIR"

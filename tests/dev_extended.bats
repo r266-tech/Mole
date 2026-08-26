@@ -2072,6 +2072,7 @@ EOF
     mkdir -p "$tmp_bin"
     cat > "$tmp_bin/xcrun" << 'XEOF'
 #!/bin/bash
+printf '%s\n' "$*" >> "$SIMCTL_CALL_LOG"
 exit 1
 XEOF
     cat > "$tmp_bin/xcode-select" << 'XEOF'
@@ -2080,7 +2081,9 @@ printf '/Library/Developer/CommandLineTools\n'
 XEOF
     chmod +x "$tmp_bin/xcrun" "$tmp_bin/xcode-select"
 
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PATH="$tmp_bin:$PATH" /bin/bash --noprofile --norc << 'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PATH="$tmp_bin:$PATH" \
+        SIMCTL_CALL_LOG="$HOME/simctl-unavailable.log" \
+        /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
@@ -2095,14 +2098,19 @@ clean_xcode_xctest_devices() { :; }
 clean_xcode_device_support() { echo "DEVICE_SUPPORT:$2"; }
 safe_clean() { echo "SAFE_CLEAN:$2"; }
 safe_clean_guarded() { echo "SAFE_CLEAN_GUARDED:$1:${*: -1}"; }
-note_activity() { :; }
+note_activity() { echo "ACTIVITY"; }
 debug_log() { :; }
 
 clean_dev_mobile
+echo "RESOLUTION_STATUS:$_MOLE_SIMCTL_RESOLUTION_STATUS"
 EOF
 
     [ "$status" -eq 0 ] || return 1
-    [[ "$output" == *"simctl could not be resolved"* ]] || return 1
+    [[ "$output" == *"RESOLUTION_STATUS:clt-only"* ]] || return 1
+    [[ "$output" != *"simctl could not be resolved"* ]] || return 1
+    [[ "$output" != *"Xcode unavailable simulators"* ]] || return 1
+    [[ "$output" != *"ACTIVITY"* ]] || return 1
+    [[ ! -e "$HOME/simctl-unavailable.log" ]] || return 1
     [[ "$output" == *"DEVICE_SUPPORT:iOS DeviceSupport"* ]] || return 1
     [[ "$output" == *"SAFE_CLEAN_GUARDED:_coresimulator_delete_guard_allows:Simulator runtime cache"* ]] || return 1
     [[ "$output" == *"SAFE_CLEAN_GUARDED:_xcode_delete_guard_allows:Xcode Interface Builder cache"* ]] || return 1

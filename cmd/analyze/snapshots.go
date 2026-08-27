@@ -14,29 +14,36 @@ import (
 const localSnapshotProbeTimeout = 3 * time.Second
 
 type localSnapshotMsg struct {
-	count int
-	err   error
+	probeID int64
+	count   int
+	err     error
 }
 
 type localSnapshotCommandRunner func(context.Context, string, ...string) ([]byte, error)
 
-func detectLocalSnapshotsCmd() tea.Cmd {
-	return localSnapshotProbeCmd(func(ctx context.Context, name string, args ...string) ([]byte, error) {
-		return exec.CommandContext(ctx, name, args...).Output()
-	})
+func runLocalSnapshotCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).Output()
 }
 
-func localSnapshotProbeCmd(run localSnapshotCommandRunner) tea.Cmd {
+func (m model) detectLocalSnapshotsCmd() tea.Cmd {
+	run := m.snapshotRunner
+	if run == nil {
+		run = runLocalSnapshotCommand
+	}
+	return localSnapshotProbeCmd(run, m.snapshotProbeID)
+}
+
+func localSnapshotProbeCmd(run localSnapshotCommandRunner, probeID int64) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), localSnapshotProbeTimeout)
 		defer cancel()
 
 		output, err := run(ctx, "/usr/bin/tmutil", "listlocalsnapshotdates", "/")
 		if err != nil {
-			return localSnapshotMsg{err: err}
+			return localSnapshotMsg{probeID: probeID, err: err}
 		}
 
-		return localSnapshotMsg{count: parseLocalSnapshotCount(output)}
+		return localSnapshotMsg{probeID: probeID, count: parseLocalSnapshotCount(output)}
 	}
 }
 

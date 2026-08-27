@@ -489,7 +489,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case localSnapshotMsg:
-		if m.inOverviewMode() && msg.probeID == m.snapshotProbeID && msg.err == nil {
+		if msg.probeID == m.snapshotProbeID && msg.err == nil {
 			m.localSnapshotCount = msg.count
 		}
 		return m, nil
@@ -1129,9 +1129,9 @@ func (m *model) switchToOverviewMode() tea.Cmd {
 	cmd := m.scheduleOverviewScans()
 	if cmd == nil {
 		m.status = "Ready"
-		return nil
+		return m.detectLocalSnapshotsCmd()
 	}
-	return tea.Batch(cmd, tickCmd())
+	return tea.Batch(cmd, m.detectLocalSnapshotsCmd(), tickCmd())
 }
 
 func (m model) enterSelectedDir() (tea.Model, tea.Cmd) {

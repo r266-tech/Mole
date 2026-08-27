@@ -136,6 +136,53 @@ func TestOverviewRefreshReprobesLocalSnapshots(t *testing.T) {
 	}
 }
 
+func TestOverviewRefreshResultSurvivesDrillDown(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	m := newModel("/", true)
+	m.snapshotRunner = func(context.Context, string, ...string) ([]byte, error) {
+		return []byte("Snapshot dates:\n"), nil
+	}
+	m.localSnapshotCount = 4
+	refreshedModel, refreshCmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	refreshed := refreshedModel.(model)
+	refreshMsg := localSnapshotMsgFromBatch(t, refreshCmd)
+
+	refreshed.entries = []dirEntry{{Name: "child", Path: t.TempDir(), Size: 1, IsDir: true}}
+	drilledModel, _ := refreshed.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	drilled := drilledModel.(model)
+	if drilled.inOverviewMode() {
+		t.Fatal("enter key left model in overview mode")
+	}
+
+	updatedModel, _ := drilled.Update(refreshMsg)
+	backModel, _ := updatedModel.(model).Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if got := backModel.(model).localSnapshotCount; got != 0 {
+		t.Fatalf("refresh completed during drill-down left snapshot count at %d", got)
+	}
+}
+
+func TestEnteringOverviewProbesLocalSnapshots(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	m := newModel(t.TempDir(), false)
+	m.snapshotRunner = func(context.Context, string, ...string) ([]byte, error) {
+		return []byte("Snapshot dates:\n2026-08-27-101500\n"), nil
+	}
+
+	overviewModel, overviewCmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	overview := overviewModel.(model)
+	if !overview.inOverviewMode() {
+		t.Fatal("escape key did not enter overview mode")
+	}
+
+	msg := localSnapshotMsgFromBatch(t, overviewCmd)
+	updatedModel, _ := overview.Update(msg)
+	if got := updatedModel.(model).localSnapshotCount; got != 1 {
+		t.Fatalf("entering overview stored snapshot count %d, want 1", got)
+	}
+}
+
 func localSnapshotMsgFromBatch(t *testing.T, cmd tea.Cmd) localSnapshotMsg {
 	t.Helper()
 	if cmd == nil {

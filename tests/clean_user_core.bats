@@ -1054,6 +1054,56 @@ EOF
 	[[ "$output" == *"REMOVE=$HOME/Library/Group Containers/group.com.example.tool/Library/Caches/cache.db SILENT=true SIZE=77"* ]] || return 1
 }
 
+@test "clean_group_container_caches dry run omits a live nested non-SQLite cache (#1471)" {
+    local live_target="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches/ComputerUse"
+    local idle_target="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches/IdleCache"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true \
+        live_target="$live_target" idle_target="$idle_target" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+should_protect_data() { return 1; }
+should_protect_path() { return 1; }
+is_path_whitelisted() { return 1; }
+_mole_user_cache_owner_process_state() { return 1; }
+lsof() {
+    printf '%s\n' "$*" >> "$lsof_trace"
+    case "$*" in
+        *"+D $live_target"*)
+            printf 'p901\nf5\nn%s\n' "$live_file"
+            return 0
+            ;;
+        *"+D $idle_target"*) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+run_with_timeout() { shift; "$@"; }
+get_path_size_kb() { printf '77\n'; }
+record_dry_run_cleanup_target() { printf 'PREVIEW=%s\n' "$1"; }
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+
+live_file="$live_target/segments/current/events.jsonl"
+lsof_trace="$HOME/container-lsof-trace"
+mkdir -p "${live_file%/*}"
+mkdir -p "$idle_target"
+printf 'event\n' > "$live_file"
+printf 'idle\n' > "$idle_target/state.json"
+clean_group_container_caches
+test -f "$live_file" || exit 1
+grep -qF "+D $live_target" "$lsof_trace" || exit 1
+grep -qF "+D $idle_target" "$lsof_trace" || exit 1
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"PREVIEW=$live_target"* ]] || return 1
+    [[ "$output" == *"PREVIEW=$idle_target"* ]] || return 1
+}
+
 @test "clean_handoff_pasteboard_cache removes stale items and keeps fresh ones (#1178)" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail

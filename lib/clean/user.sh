@@ -954,6 +954,9 @@ clean_app_caches() {
     local precise_size_limit="${MOLE_CONTAINER_CACHE_PRECISE_SIZE_LIMIT:-64}"
     [[ "$precise_size_limit" =~ ^[0-9]+$ ]] || precise_size_limit=64
     local precise_size_used=0
+    # Recursive lsof probes fail closed after one cumulative section budget;
+    # candidate count cannot multiply the per-command timeout into minutes.
+    local _MOLE_CONTAINER_CACHE_PROBE_DEADLINE=""
 
     local _ng_state
     _ng_state=$(shopt -p nullglob || true)
@@ -1114,6 +1117,13 @@ process_container_cache() {
                 total_size_partial=true
             fi
 
+            # Dry-run bypasses safe_remove, so ask the same deletion funnel
+            # immediately before registering this preview candidate.
+            _mole_reset_process_snapshot
+            if ! validate_path_for_deletion "$item" 2> /dev/null; then
+                continue
+            fi
+
             if declare -f register_dry_run_cleanup_target > /dev/null 2>&1; then
                 register_dry_run_cleanup_target "$item" || continue
             fi
@@ -1185,6 +1195,7 @@ clean_group_container_caches() {
     local total_size_partial=false
     local cleaned_count=0
     local found_any=false
+    local _MOLE_CONTAINER_CACHE_PROBE_DEADLINE=""
 
     local container_dir
     local _nullglob_state
@@ -1273,6 +1284,10 @@ clean_group_container_caches() {
                         continue
                     fi
                     if [[ "$DRY_RUN" == "true" ]] && declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                        _mole_reset_process_snapshot
+                        if ! validate_path_for_deletion "$item" 2> /dev/null; then
+                            continue
+                        fi
                         record_dry_run_cleanup_target "$item" 0 1 false || continue
                     fi
                     candidate_changed=true
@@ -1294,6 +1309,10 @@ clean_group_container_caches() {
                     [[ $size_rc -eq 0 ]] || return "$size_rc"
                     [[ "$item_size" =~ ^[0-9]+$ ]] || item_size=0
                     if [[ "$DRY_RUN" == "true" ]]; then
+                        _mole_reset_process_snapshot
+                        if ! validate_path_for_deletion "$item" 2> /dev/null; then
+                            continue
+                        fi
                         if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
                             record_dry_run_cleanup_target "$item" "$item_size" 1 true || continue
                         fi

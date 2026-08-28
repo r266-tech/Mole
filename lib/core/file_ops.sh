@@ -161,26 +161,54 @@ _mole_is_active_powerlog_database_path() {
 # under one cache directory does not fork pgrep once per leaf file. Bash 3.2
 # has no associative arrays, so the cache is a pipe-delimited string.
 
-_mole_user_library_caches_prefix() {
-    printf '%s\n' "${HOME%/}/Library/Caches"
+_mole_user_cache_scope() {
+    local path="$1"
+    local normalized="${path%/}"
+    local library_root="${HOME%/}/Library"
+    local remainder=""
+    local component=""
+    local suffix=""
+    local scope_type=""
+
+    case "$normalized" in
+        "$library_root/Caches"/*)
+            remainder="${normalized#"$library_root/Caches"/}"
+            component="${remainder%%/*}"
+            scope_type="standard"
+            ;;
+        "$library_root/Containers"/*)
+            remainder="${normalized#"$library_root/Containers"/}"
+            component="${remainder%%/*}"
+            suffix="${remainder#"$component"}"
+            case "$suffix" in
+                /Data/Library/Caches | /Data/Library/Caches/*) scope_type="container" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        "$library_root/Group Containers"/*)
+            remainder="${normalized#"$library_root/Group Containers"/}"
+            component="${remainder%%/*}"
+            suffix="${remainder#"$component"}"
+            case "$suffix" in
+                /Caches | /Caches/* | /Library/Caches | /Library/Caches/*) scope_type="container" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+
+    # Reverse-DNS style only (com.vendor.app). Named trees such as Homebrew
+    # stay outside this gate; they have their own process probes. The separator
+    # is excluded so the caller can split this Bash-3.2-compatible record.
+    [[ "$component" == *.* && "$component" != .* && "$component" != *"|"* ]] || return 1
+    printf '%s|%s\n' "$component" "$scope_type"
+    return 0
 }
 
 _mole_user_cache_owner_component() {
-    local path="$1"
-    local prefix
-    prefix=$(_mole_user_library_caches_prefix)
-    local normalized="${path%/}"
-    case "$normalized" in
-        "$prefix"/*) ;;
-        *) return 1 ;;
-    esac
-    local remainder="${normalized#"$prefix"/}"
-    local component="${remainder%%/*}"
-    # Reverse-DNS style only (com.vendor.app). Named trees such as Homebrew
-    # stay outside this gate; they have their own process probes.
-    [[ "$component" == *.* && "$component" != .* ]] || return 1
-    printf '%s\n' "$component"
-    return 0
+    local scope=""
+    scope=$(_mole_user_cache_scope "$1") || return 1
+    printf '%s\n' "${scope%%|*}"
 }
 
 # SQLite main file or -wal / -shm / -journal companion. Case-insensitive so a
@@ -471,11 +499,58 @@ _mole_user_cache_sqlite_has_open_handle() {
     return "$state"
 }
 
-# Return 0 when deletion must be refused (live owner or open SQLite handle).
+# Is any process holding the exact container-cache file, or a descendant of
+# the directory, open? 0 = in use, 1 = conclusively idle, 2 = could not tell.
+_mole_container_cache_has_open_handle() {
+    local path="$1"
+    command -v lsof > /dev/null 2>&1 || return 2
+    declare -f run_with_timeout > /dev/null 2>&1 || return 2
+    [[ -e "$path" ]] || return 1
+
+    if [[ -n "${_MOLE_CONTAINER_CACHE_PROBE_DEADLINE+x}" &&
+        -z "$_MOLE_CONTAINER_CACHE_PROBE_DEADLINE" ]]; then
+        _MOLE_CONTAINER_CACHE_PROBE_DEADLINE=$((SECONDS + MOLE_TIMEOUT_MEDIUM_PROBE_SEC))
+    fi
+    local probe_timeout=""
+    if ! probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        "${_MOLE_CONTAINER_CACHE_PROBE_DEADLINE:-}"); then
+        debug_log "Container cache handle probe budget exhausted, keep: $path"
+        return 2
+    fi
+    local lsof_rc=0
+    local records=""
+    if [[ -d "$path" ]]; then
+        records=$(run_with_timeout "$probe_timeout" \
+            lsof -F pfn +D "$path" < /dev/null 2>&1) || lsof_rc=$?
+    else
+        records=$(run_with_timeout "$probe_timeout" \
+            lsof -F pfn -- "$path" < /dev/null 2>&1) || lsof_rc=$?
+    fi
+
+    if [[ $lsof_rc -eq 0 ]]; then
+        return 0
+    fi
+    # A recursive walk may report one open record and still fail on another
+    # descendant. Field output starts with p/f/n; warning prose does not.
+    if [[ -n "$records" ]] && LC_ALL=C grep -qE '^[pfn]' <<< "$records"; then
+        return 0
+    fi
+    # Only status 1 with completely empty output is a conclusive no-match for
+    # this snapshot. It is not an ownership lease: safe_remove minimizes the
+    # unavoidable reopen window by taking this snapshot at the final sink.
+    # Missing lsof/timeout helper, timeout, signal, traversal warning, or other
+    # error is unknown and must not authorize deletion.
+    [[ $lsof_rc -eq 1 && -z "$records" ]] || return 2
+    return 1
+}
+
+# Return 0 when deletion must be refused (live owner or open cache handle).
 _mole_should_refuse_live_user_cache_path() {
     local path="$1"
-    local owner=""
-    owner=$(_mole_user_cache_owner_component "$path") || return 1
+    local scope=""
+    scope=$(_mole_user_cache_scope "$path") || return 1
+    local owner="${scope%%|*}"
+    local scope_type="${scope#*|}"
 
     local process_state=0
     _mole_user_cache_owner_process_state "$owner" || process_state=$?
@@ -488,9 +563,25 @@ _mole_should_refuse_live_user_cache_path() {
         return 0
     fi
 
-    # Process is conclusively idle. Still refuse SQLite family members that
-    # another process has open, or that still expose a WAL -shm (PR #1391).
-    if _mole_is_user_cache_sqlite_family_path "$path"; then
+    # Container ids and helper process names need not correspond (for example,
+    # a team-prefixed Group Container used by SkyComputerUseService). Inspect
+    # every open descendant instead of treating process-name silence as idle.
+    if [[ "$scope_type" == "container" ]]; then
+        # A real safe_remove defers this comparatively expensive recursive
+        # probe to its final-sink recheck. Nothing mutates the target between
+        # initial validation and that boundary. Dry-run and direct validators
+        # do not set this dynamic-scope flag and still probe here.
+        if [[ "${_MOLE_DEFER_CONTAINER_HANDLE_PROBE:-false}" == "true" ]]; then
+            return 1
+        fi
+        local container_open_state=0
+        _mole_container_cache_has_open_handle "$path" || container_open_state=$?
+        if [[ $container_open_state -eq 0 || $container_open_state -eq 2 ]]; then
+            debug_log "Container cache handle not conclusively idle, keep: $path"
+            return 0
+        fi
+    # Standard reverse-DNS caches retain the narrower SQLite-family probe.
+    elif _mole_is_user_cache_sqlite_family_path "$path"; then
         local open_state=0
         _mole_user_cache_sqlite_has_open_handle "$path" || open_state=$?
         if [[ $open_state -eq 0 || $open_state -eq 2 ]]; then
@@ -920,6 +1011,7 @@ safe_remove() {
     local expected_parent="${5:-}"
     local expected_parent_id="${6:-}"
     local expected_target_id="${7:-}"
+    local _MOLE_DEFER_CONTAINER_HANDLE_PROBE=false
 
     local pending_clean_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
     if [[ "${MOLE_CURRENT_COMMAND:-}" == "clean" &&
@@ -929,11 +1021,17 @@ safe_remove() {
 
     # Validate path. Silent cleanup callers still need the same policy result,
     # but should not print one validation warning per skipped cache item.
+    # Real cleanup performs its recursive container-handle probe once, at the
+    # final sink below. Dry-run returns before that boundary, so it probes now.
+    if [[ "${MOLE_DRY_RUN:-0}" != "1" ]]; then
+        _MOLE_DEFER_CONTAINER_HANDLE_PROBE=true
+    fi
     if [[ "$silent" == "true" ]]; then
         validate_path_for_deletion "$path" 2> /dev/null || return 1
     elif ! validate_path_for_deletion "$path"; then
         return 1
     fi
+    _MOLE_DEFER_CONTAINER_HANDLE_PROBE=false
 
     # Honor the user whitelist here, not just in safe_clean. safe_remove is
     # called directly by several clean/optimize flows (Xcode DerivedData,

@@ -411,6 +411,212 @@ EOF
     [ "$status" -eq 0 ]
 }
 
+@test "validate_path_for_deletion refuses open descendants in app and group container caches (#1471)" {
+    local app_cache="$HOME/Library/Containers/com.example.Editor/Data/Library/Caches/LiveState"
+    local group_cache="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches/History"
+    mkdir -p "$app_cache/nested" "$group_cache/segments/current"
+    printf 'state\n' > "$app_cache/nested/session.json"
+    printf 'event\n' > "$group_cache/segments/current/events.jsonl"
+
+    local path
+    for path in "$app_cache" "$group_cache"; do
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" path="$path" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+lsof() {
+    [[ "$*" == *"+D $path"* ]] || return 2
+    printf 'p901\nf5\nn%s/nested/open.jsonl\n' "$path"
+    return 0
+}
+run_with_timeout() { shift; "$@"; }
+validate_path_for_deletion "$path"
+EOF
+        [ "$status" -eq 1 ] || return 1
+    done
+}
+
+@test "container cache handle probe is bounded and fails closed on uncertain results (#1471)" {
+    local cache_dir="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches/History"
+    mkdir -p "$cache_dir/segments"
+    printf 'event\n' > "$cache_dir/segments/events.jsonl"
+
+    local probe_rc
+    for probe_rc in 2 124 130; do
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" probe_rc="$probe_rc" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+lsof() { return "$probe_rc"; }
+run_with_timeout() {
+    [[ "$1" == "$MOLE_TIMEOUT_QUICK_DETECT_SEC" ]] || return 99
+    shift
+    "$@"
+}
+validate_path_for_deletion "$cache_dir"
+EOF
+        [ "$status" -eq 1 ] || return 1
+    done
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+PATH=/bin
+validate_path_for_deletion "$cache_dir"
+EOF
+    [ "$status" -eq 1 ] || return 1
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+unset -f run_with_timeout
+validate_path_for_deletion "$cache_dir"
+EOF
+    [ "$status" -eq 1 ] || return 1
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+lsof() {
+    printf 'lsof: WARNING: cannot stat a descendant\n' >&2
+    return 1
+}
+run_with_timeout() { shift; "$@"; }
+validate_path_for_deletion "$cache_dir"
+EOF
+    [ "$status" -eq 1 ] || return 1
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+lsof() { printf 'UNEXPECTED_LSOF\n'; return 0; }
+run_with_timeout() { printf 'UNEXPECTED_TIMEOUT\n'; return 0; }
+_MOLE_CONTAINER_CACHE_PROBE_DEADLINE=$SECONDS
+validate_path_for_deletion "$cache_dir"
+EOF
+    [ "$status" -eq 1 ] || return 1
+    [[ "$output" != *"UNEXPECTED_"* ]] || return 1
+}
+
+@test "validate_path_for_deletion allows a conclusively idle container cache (#1471)" {
+    local cache_dir="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches/Idle"
+    mkdir -p "$cache_dir"
+    printf 'idle\n' > "$cache_dir/state.json"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+lsof() { return 1; }
+run_with_timeout() { shift; "$@"; }
+validate_path_for_deletion "$cache_dir"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+}
+
+@test "container cache probe budget stops later recursive lsof calls fail closed (#1471)" {
+    local cache_root="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches"
+    mkdir -p "$cache_root/First" "$cache_root/Second" "$cache_root/Third"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" cache_root="$cache_root" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+timeout_calls=$(mktemp)
+lsof_calls=$(mktemp)
+_mole_timeout_with_deadline() {
+    printf 'call\n' >> "$timeout_calls"
+    call_count=$(wc -l < "$timeout_calls" | tr -d ' ')
+    [[ $call_count -eq 1 ]] || return 124
+    printf '2\n'
+}
+lsof() {
+    printf 'call\n' >> "$lsof_calls"
+    return 1
+}
+run_with_timeout() { shift; "$@"; }
+_MOLE_CONTAINER_CACHE_PROBE_DEADLINE=""
+
+states=""
+for item in "$cache_root/First" "$cache_root/Second" "$cache_root/Third"; do
+    state=0
+    validate_path_for_deletion "$item" || state=$?
+    states="${states}${state}"
+done
+lsof_count=$(wc -l < "$lsof_calls" | tr -d ' ')
+command rm -f "$timeout_calls" "$lsof_calls"
+printf 'STATES=%s LSOF_CALLS=%s\n' "$states" "$lsof_count"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"STATES=011 LSOF_CALLS=1"* ]] || return 1
+}
+
+@test "container cache guard detects a real open descendant through bounded lsof (#1471)" {
+    command -v lsof > /dev/null 2>&1 || skip "lsof is unavailable"
+    local cache_dir="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches/RealHandle"
+    local live_file="$cache_dir/segments/events.jsonl"
+    mkdir -p "${live_file%/*}"
+    printf 'event\n' > "$live_file"
+
+    exec 9> "$live_file"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+validate_path_for_deletion "$cache_dir"
+EOF
+    exec 9>&-
+
+    [ "$status" -eq 1 ] || return 1
+}
+
+@test "safe_remove rechecks container handles at the final deletion boundary (#1471)" {
+    local cache_dir="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches/History"
+    mkdir -p "$cache_dir/segments"
+    printf 'event\n' > "$cache_dir/segments/events.jsonl"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_DIR="$cache_dir" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+lsof_calls=$(mktemp)
+rm_calls=$(mktemp)
+size_marker=$(mktemp)
+command rm -f "$size_marker"
+lsof() {
+    printf 'call\n' >> "$lsof_calls"
+    [[ -f "$size_marker" ]] || return 2
+    printf 'p901\nf5\nn%s/segments/events.jsonl\n' "$TARGET_DIR"
+    return 0
+}
+run_with_timeout() { shift; "$@"; }
+get_path_size_kb() {
+    printf 'sized\n' > "$size_marker"
+    printf '1\n'
+}
+oplog_enabled() { return 0; }
+rm() { printf 'call\n' >> "$rm_calls"; return 99; }
+
+remove_rc=0
+safe_remove "$TARGET_DIR" true || remove_rc=$?
+lsof_call_count=$(wc -l < "$lsof_calls" | tr -d ' ')
+rm_call_count=$(wc -l < "$rm_calls" | tr -d ' ')
+command rm -f "$lsof_calls" "$rm_calls" "$size_marker"
+printf 'RC=%s LSOF_CALLS=%s EXISTS=%s RM_CALLS=%s\n' \
+    "$remove_rc" "$lsof_call_count" "$(test -d "$TARGET_DIR" && echo yes || echo no)" \
+    "$rm_call_count"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"RC=1 LSOF_CALLS=1 EXISTS=yes RM_CALLS=0"* ]] || return 1
+}
+
 @test "should_protect_path applies high-risk cleanup denylist" {
     run /bin/bash -c "
         source '$PROJECT_ROOT/lib/core/common.sh'

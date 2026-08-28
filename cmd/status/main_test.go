@@ -421,6 +421,8 @@ func TestMetricsSnapshotFieldsHaveCollectionClassifications(t *testing.T) {
 		"Sensors":        "enrichment",
 		"Bluetooth":      "enrichment",
 		"TopProcesses":   "live-or-enrichment",
+		"ZombieCount":    "live-or-enrichment",
+		"ZombieParents":  "live-or-enrichment",
 		"ProcessWatch":   "config",
 		"ProcessAlerts":  "live-or-enrichment",
 	}

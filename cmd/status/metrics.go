@@ -85,6 +85,8 @@ type MetricsSnapshot struct {
 	Sensors        []SensorReading    `json:"sensors"`
 	Bluetooth      []BluetoothDevice  `json:"bluetooth"`
 	TopProcesses   []ProcessInfo      `json:"top_processes"`
+	ZombieCount    *int               `json:"zombie_count,omitempty"`
+	ZombieParents  []ZombieParent     `json:"zombie_parents"`
 	ProcessWatch   ProcessWatchConfig `json:"process_watch"`
 	ProcessAlerts  []ProcessAlert     `json:"process_alerts"`
 }
@@ -106,11 +108,18 @@ type DiskIOStatus struct {
 type ProcessInfo struct {
 	PID         int     `json:"pid"`
 	PPID        int     `json:"ppid"`
+	State       string  `json:"-"`
 	Name        string  `json:"name"`
 	Command     string  `json:"command"`
 	CPU         float64 `json:"cpu"`
 	Memory      float64 `json:"memory"` // Percent of physical memory, kept for compatibility.
 	MemoryBytes uint64  `json:"memory_bytes,omitempty"`
+}
+
+type ZombieParent struct {
+	PID   int    `json:"pid"`
+	Name  string `json:"name"`
+	Count int    `json:"count"`
 }
 
 type CPUStatus struct {
@@ -287,6 +296,9 @@ type snapshotEnrichment struct {
 	sensors        []SensorReading
 	bluetooth      []BluetoothDevice
 	topProcesses   []ProcessInfo
+	zombieCount    int
+	hasZombieCount bool
+	zombieParents  []ZombieParent
 	processAlerts  []ProcessAlert
 }
 
@@ -461,8 +473,13 @@ func (c *Collector) snapshotFromMetrics(now time.Time, hostInfo *host.InfoStat, 
 		hostInfo.Uptime,
 	)
 	var topProcs []ProcessInfo
+	var zombieCount *int
+	var zombieParents []ZombieParent
 	if collected.hasProcesses {
 		topProcs = topProcesses(collected.allProcs, 5)
+		count, parents := summarizeZombies(collected.allProcs, zombieParentLimit)
+		zombieCount = &count
+		zombieParents = parents
 	}
 
 	var processAlerts []ProcessAlert
@@ -504,6 +521,8 @@ func (c *Collector) snapshotFromMetrics(now time.Time, hostInfo *host.InfoStat, 
 		Sensors:       collected.sensorStats,
 		Bluetooth:     collected.btStats,
 		TopProcesses:  topProcs,
+		ZombieCount:   zombieCount,
+		ZombieParents: zombieParents,
 		ProcessWatch:  c.processWatch,
 		ProcessAlerts: processAlerts,
 	}
@@ -517,7 +536,7 @@ func (c *Collector) hardwareForSnapshot() HardwareInfo {
 }
 
 func (c *Collector) cacheEnrichment(snapshot MetricsSnapshot) {
-	c.enrichment = snapshotEnrichment{
+	next := snapshotEnrichment{
 		hardware:       snapshot.Hardware,
 		cpuPCores:      snapshot.CPU.PCoreCount,
 		cpuECores:      snapshot.CPU.ECoreCount,
@@ -536,6 +555,16 @@ func (c *Collector) cacheEnrichment(snapshot MetricsSnapshot) {
 		topProcesses:   slices.Clone(snapshot.TopProcesses),
 		processAlerts:  slices.Clone(snapshot.ProcessAlerts),
 	}
+	if snapshot.ZombieCount != nil {
+		next.zombieCount = *snapshot.ZombieCount
+		next.hasZombieCount = true
+		next.zombieParents = slices.Clone(snapshot.ZombieParents)
+	} else if c.hasEnrichment && c.enrichment.hasZombieCount {
+		next.zombieCount = c.enrichment.zombieCount
+		next.hasZombieCount = true
+		next.zombieParents = slices.Clone(c.enrichment.zombieParents)
+	}
+	c.enrichment = next
 	c.hasEnrichment = true
 }
 
@@ -579,6 +608,15 @@ func (e snapshotEnrichment) apply(snapshot *MetricsSnapshot, preserveLiveProcess
 	snapshot.Bluetooth = slices.Clone(e.bluetooth)
 	if !preserveLiveProcesses {
 		snapshot.TopProcesses = slices.Clone(e.topProcesses)
+		// Reuse the most recent process sample on fast paints, on the same cadence
+		// as TopProcesses. Before the first successful process sample the pointer
+		// remains nil, so JSON consumers can distinguish unknown from measured zero.
+		snapshot.ZombieCount = nil
+		if e.hasZombieCount {
+			count := e.zombieCount
+			snapshot.ZombieCount = &count
+		}
+		snapshot.ZombieParents = slices.Clone(e.zombieParents)
 		snapshot.ProcessAlerts = slices.Clone(e.processAlerts)
 	}
 }

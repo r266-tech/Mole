@@ -258,27 +258,34 @@ append_dry_run_cleanup_target() {
 # prepared ledger retain the legacy in-memory duplicate check.
 record_dry_run_cleanup_target() {
     local path="$1"
-    if declare -f should_protect_path > /dev/null 2>&1 && should_protect_path "$path" 2> /dev/null; then
-        return 1
-    fi
-    if declare -f is_path_whitelisted > /dev/null 2>&1 && is_path_whitelisted "$path" 2> /dev/null; then
-        return 1
-    fi
-    if declare -f holds_compiled_model_cache > /dev/null 2>&1 && holds_compiled_model_cache "$path" 2> /dev/null; then
-        return 1
-    fi
-    # Keep preview eligibility identical to real cleanup (#1390 / PR #1391).
-    if declare -f _mole_should_refuse_live_user_cache_path > /dev/null 2>&1 &&
-        _mole_should_refuse_live_user_cache_path "$path"; then
-        return 1
-    fi
-    if declare -f _mole_is_sqlite_database_path > /dev/null 2>&1 &&
-        _mole_is_sqlite_database_path "$path" &&
-        declare -f _mole_sqlite_database_in_use > /dev/null 2>&1; then
-        local sqlite_state=0
-        _mole_sqlite_database_in_use "$path" || sqlite_state=$?
-        if [[ $sqlite_state -eq 0 || $sqlite_state -eq 2 ]]; then
+    if [[ "${_MOLE_DRY_RUN_TARGET_PREVALIDATED:-false}" != "true" ]]; then
+        if declare -f should_protect_path > /dev/null 2>&1 && should_protect_path "$path" 2> /dev/null; then
             return 1
+        fi
+        if declare -f is_path_whitelisted > /dev/null 2>&1 && is_path_whitelisted "$path" 2> /dev/null; then
+            return 1
+        fi
+        if declare -f holds_compiled_model_cache > /dev/null 2>&1 && holds_compiled_model_cache "$path" 2> /dev/null; then
+            return 1
+        fi
+        # Keep preview eligibility identical to real cleanup (#1390 / PR #1391).
+        if declare -f _mole_should_refuse_live_user_cache_path > /dev/null 2>&1; then
+            local live_cache_state=0
+            _mole_should_refuse_live_user_cache_path "$path" || live_cache_state=$?
+            if [[ $live_cache_state -eq 0 || $live_cache_state -eq 2 ]]; then
+                return 1
+            fi
+            [[ $live_cache_state -ge 128 ]] && return "$live_cache_state"
+        fi
+        if declare -f _mole_is_sqlite_database_path > /dev/null 2>&1 &&
+            _mole_is_sqlite_database_path "$path" &&
+            declare -f _mole_sqlite_database_in_use > /dev/null 2>&1; then
+            local sqlite_state=0
+            _mole_sqlite_database_in_use "$path" || sqlite_state=$?
+            if [[ $sqlite_state -eq 0 || $sqlite_state -eq 2 ]]; then
+                return 1
+            fi
+            [[ $sqlite_state -ge 128 ]] && return "$sqlite_state"
         fi
     fi
 

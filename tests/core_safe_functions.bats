@@ -442,7 +442,7 @@ EOF
     printf 'event\n' > "$cache_dir/segments/events.jsonl"
 
     local probe_rc
-    for probe_rc in 2 124 130; do
+    for probe_rc in 2 124; do
         run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" probe_rc="$probe_rc" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
@@ -500,6 +500,95 @@ validate_path_for_deletion "$cache_dir"
 EOF
     [ "$status" -eq 1 ] || return 1
     [[ "$output" != *"UNEXPECTED_"* ]] || return 1
+}
+
+@test "container cache probe accepts fractional cumulative timeout overrides (#1471)" {
+    local cache_dir="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches/Fractional"
+    local lsof_trace="$HOME/fractional-lsof-trace"
+    mkdir -p "$cache_dir"
+    printf 'idle\n' > "$cache_dir/state.json"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" \
+        lsof_trace="$lsof_trace" MOLE_TIMEOUT_MEDIUM_PROBE_SEC=2.5 \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+lsof() { printf 'call\n' >> "$lsof_trace"; return 1; }
+run_with_timeout() { shift; "$@"; }
+_MOLE_CONTAINER_CACHE_PROBE_DEADLINE=""
+validate_path_for_deletion "$cache_dir"
+printf 'DEADLINE=%s\n' "$_MOLE_CONTAINER_CACHE_PROBE_DEADLINE"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [ "$(wc -l < "$lsof_trace" | tr -d ' ')" -eq 1 ] || return 1
+    local deadline="${output##*DEADLINE=}"
+    [[ "$deadline" =~ ^[0-9]+$ ]] || return 1
+}
+
+@test "safe_remove preserves an interrupted container probe and stops later deletes (#1471)" {
+    local cache_root="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches"
+    local first="$cache_root/First"
+    local second="$cache_root/Second"
+    mkdir -p "$first" "$second"
+    printf 'first\n' > "$first/state.json"
+    printf 'second\n' > "$second/state.json"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" first="$first" second="$second" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+lsof_trace=$(mktemp)
+lsof() { printf 'call\n' >> "$lsof_trace"; return 130; }
+run_with_timeout() { shift; "$@"; }
+rm() { printf 'UNEXPECTED_REMOVE:%s\n' "$*"; return 99; }
+MOLE_CURRENT_COMMAND=clean
+MOLE_CLEAN_CANCEL_STATUS=0
+first_rc=0
+safe_remove "$first" true 1 || first_rc=$?
+second_rc=0
+safe_remove "$second" true 1 || second_rc=$?
+lsof_calls=$(wc -l < "$lsof_trace" | tr -d ' ')
+command rm -f "$lsof_trace"
+printf 'FIRST_RC=%s SECOND_RC=%s CANCEL=%s LSOF=%s FIRST=%s SECOND=%s\n' \
+    "$first_rc" "$second_rc" "$MOLE_CLEAN_CANCEL_STATUS" "$lsof_calls" \
+    "$(test -d "$first" && echo yes || echo no)" \
+    "$(test -d "$second" && echo yes || echo no)"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"FIRST_RC=130 SECOND_RC=130 CANCEL=130 LSOF=1 FIRST=yes SECOND=yes"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
+}
+
+@test "container cache probe refuses a path replaced during lsof (#1471)" {
+    local cache_dir="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches/Race"
+    mkdir -p "$cache_dir"
+    printf 'old\n' > "$cache_dir/state.json"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+lsof() {
+    mv "$cache_dir" "$cache_dir-old"
+    mkdir -p "$cache_dir"
+    printf 'new-live\n' > "$cache_dir/events.jsonl"
+    return 1
+}
+run_with_timeout() { shift; "$@"; }
+remove_rc=0
+safe_remove "$cache_dir" true 1 || remove_rc=$?
+printf 'RC=%s NEW=%s OLD=%s\n' "$remove_rc" \
+    "$(test -f "$cache_dir/events.jsonl" && echo yes || echo no)" \
+    "$(test -f "$cache_dir-old/state.json" && echo yes || echo no)"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"RC=1 NEW=yes OLD=yes"* ]] || return 1
 }
 
 @test "validate_path_for_deletion allows a conclusively idle container cache (#1471)" {
@@ -588,15 +677,18 @@ _mole_user_cache_owner_process_state() { return 1; }
 lsof_calls=$(mktemp)
 rm_calls=$(mktemp)
 size_marker=$(mktemp)
+order_trace=$(mktemp)
 command rm -f "$size_marker"
 lsof() {
     printf 'call\n' >> "$lsof_calls"
+    printf 'LSOF\n' >> "$order_trace"
     [[ -f "$size_marker" ]] || return 2
     printf 'p901\nf5\nn%s/segments/events.jsonl\n' "$TARGET_DIR"
     return 0
 }
 run_with_timeout() { shift; "$@"; }
 get_path_size_kb() {
+    printf 'SIZE\n' >> "$order_trace"
     printf 'sized\n' > "$size_marker"
     printf '1\n'
 }
@@ -607,14 +699,15 @@ remove_rc=0
 safe_remove "$TARGET_DIR" true || remove_rc=$?
 lsof_call_count=$(wc -l < "$lsof_calls" | tr -d ' ')
 rm_call_count=$(wc -l < "$rm_calls" | tr -d ' ')
-command rm -f "$lsof_calls" "$rm_calls" "$size_marker"
-printf 'RC=%s LSOF_CALLS=%s EXISTS=%s RM_CALLS=%s\n' \
+order=$(tr '\n' ',' < "$order_trace")
+command rm -f "$lsof_calls" "$rm_calls" "$size_marker" "$order_trace"
+printf 'RC=%s LSOF_CALLS=%s EXISTS=%s RM_CALLS=%s ORDER=%s\n' \
     "$remove_rc" "$lsof_call_count" "$(test -d "$TARGET_DIR" && echo yes || echo no)" \
-    "$rm_call_count"
+    "$rm_call_count" "$order"
 EOF
 
     [ "$status" -eq 0 ] || return 1
-    [[ "$output" == *"RC=1 LSOF_CALLS=1 EXISTS=yes RM_CALLS=0"* ]] || return 1
+    [[ "$output" == *"RC=1 LSOF_CALLS=1 EXISTS=yes RM_CALLS=0 ORDER=SIZE,LSOF,"* ]] || return 1
 }
 
 @test "should_protect_path applies high-risk cleanup denylist" {
@@ -860,7 +953,42 @@ printf 'CALLS=%s EXISTS=%s\n' "$guard_calls" "$(test -d "$TARGET_DIR" && echo ye
 EOF
 
     [ "$status" -eq 0 ] || return 1
-	[[ "$output" == *"CALLS=2 EXISTS=yes"* ]] || return 1
+    [[ "$output" == *"CALLS=1 EXISTS=yes"* ]] || return 1
+}
+
+@test "safe_remove dry-run rechecks live cache state after sizing (#1471)" {
+    local target_dir="$TEST_DIR/cache-live-after-size"
+    mkdir -p "$target_dir"
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" TARGET_DIR="$target_dir" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/bin/clean.sh"
+state_file="$TARGET_DIR/.sized"
+trace_file="$TARGET_DIR/.trace"
+_mole_should_refuse_live_user_cache_path() {
+    [[ "${_MOLE_DEFER_CONTAINER_HANDLE_PROBE:-false}" == "true" ]] && return 1
+    printf 'GUARD:%s\n' "$(test -f "$state_file" && echo live || echo idle)" >> "$trace_file"
+    [[ -f "$state_file" ]]
+}
+get_path_size_kb() {
+    printf 'SIZE\n' >> "$trace_file"
+    touch "$state_file"
+    printf '7\n'
+}
+register_dry_run_cleanup_target() { printf 'UNEXPECTED_REGISTER:%s\n' "$1"; }
+append_dry_run_cleanup_target() { printf 'UNEXPECTED_APPEND:%s\n' "$1"; }
+MOLE_DRY_RUN=1 safe_remove "$TARGET_DIR" true && rc=0 || rc=$?
+printf 'RC=%s\n' "$rc"
+cat "$trace_file"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"RC=1"* ]] || return 1
+    [[ "$output" == *$'SIZE\nGUARD:live'* ]] || return 1
+    [[ "$(grep -c '^GUARD:' <<< "$output")" -eq 1 ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REGISTER"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_APPEND"* ]] || return 1
 }
 
 @test "safe_remove in silent mode suppresses error output" {
@@ -2468,32 +2596,26 @@ EOF
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_FILE="$target_file" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
-ps_calls=$(mktemp)
+owner_calls=$(mktemp)
 rm_calls=$(mktemp)
-ps() {
-	printf 'call\n' >> "$ps_calls"
-	call_count=$(wc -l < "$ps_calls" | tr -d ' ')
-	if [[ $call_count -eq 1 ]]; then
-		cat <<'TABLE'
-  PID  PPID COMM             ARGS
-TABLE
-	else
-		cat <<'TABLE'
-  PID  PPID COMM             ARGS
-  901     1 /Applications/Example.app/Contents/MacOS/LateHelper /Applications/Example.app/Contents/MacOS/LateHelper com.example.LateHelper
-TABLE
-	fi
+owner_live="$TARGET_FILE.owner-live"
+_mole_user_cache_owner_process_state() {
+	printf 'call\n' >> "$owner_calls"
+	[[ -f "$owner_live" ]]
 }
 lsof() { return 1; }
-get_path_size_kb() { printf '1\n'; }
+get_path_size_kb() {
+	touch "$owner_live"
+	printf '1\n'
+}
 oplog_enabled() { return 0; }
 rm() { printf 'call\n' >> "$rm_calls"; return 99; }
 
 remove_rc=0
 safe_remove "$TARGET_FILE" true || remove_rc=$?
-call_count=$(wc -l < "$ps_calls" | tr -d ' ')
+call_count=$(wc -l < "$owner_calls" | tr -d ' ')
 rm_call_count=$(wc -l < "$rm_calls" | tr -d ' ')
-command rm -f "$ps_calls" "$rm_calls"
+command rm -f "$owner_calls" "$owner_live" "$rm_calls"
 printf 'RC=%s CALLS=%s EXISTS=%s RM_CALLS=%s\n' \
 	"$remove_rc" "$call_count" "$(test -f "$TARGET_FILE" && echo yes || echo no)" \
 	"$rm_call_count"

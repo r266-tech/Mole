@@ -1792,6 +1792,8 @@ clean_remote_desktop() {
 }
 # Main entry for GUI app cleanup.
 clean_user_gui_applications() {
+    # Product and media App Container rows share one recursive-handle budget.
+    local _MOLE_CONTAINER_CACHE_PROBE_DEADLINE=""
     stop_section_spinner
     clean_communication_apps
     clean_dingtalk

@@ -733,7 +733,9 @@ EOF
 }
 
 @test "clean_app_caches skips expensive size scans for large sandboxed caches" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true /bin/bash --noprofile --norc << 'EOF'
+    local large_home
+    large_home=$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-large-container.XXXXXX")
+    run env HOME="$large_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
@@ -745,24 +747,28 @@ safe_clean() { :; }
 should_protect_data() { return 1; }
 is_critical_system_component() { return 1; }
 get_path_size_kb() {
-    echo "SHOULD_NOT_SIZE_SCAN"
-    return 0
+    printf 'SIZE:%s\n' "$1" >> "$size_trace"
+    printf '7\n'
 }
+safe_remove() { return 0; }
 files_cleaned=0
 total_size_cleaned=0
 total_items=0
 
+size_trace="$HOME/size-trace"
 mkdir -p "$HOME/Library/Containers/com.example.large/Data/Library/Caches"
 for i in $(seq 1 101); do
     touch "$HOME/Library/Containers/com.example.large/Data/Library/Caches/file-$i.tmp"
 done
 
 clean_app_caches
+printf 'SIZE_CALLS=%s\n' "$(wc -l < "$size_trace" 2> /dev/null || printf '0')"
 EOF
 
+    rm -rf "$large_home"
     [ "$status" -eq 0 ]
     [[ "$output" == *"Sandboxed app caches"* ]] || return 1
-    [[ "$output" != *"SHOULD_NOT_SIZE_SCAN"* ]]
+    [[ "$output" == *"SIZE_CALLS=0"* ]]
 }
 
 @test "clean_application_support_logs counts nested directory contents in dry-run size summary" {
@@ -1104,6 +1110,182 @@ EOF
     [[ "$output" == *"PREVIEW=$idle_target"* ]] || return 1
 }
 
+@test "clean_group_container_caches dry run omits compiled model cache parents (#1471)" {
+    local model_home
+    model_home=$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-model-group.XXXXXX")
+    local model_parent="$model_home/Library/Group Containers/TEAM.com.example.shared/Library/Caches/Vision"
+    local idle_target="$model_home/Library/Group Containers/TEAM.com.example.shared/Library/Caches/ZIdle"
+    run env HOME="$model_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 \
+        model_parent="$model_parent" idle_target="$idle_target" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+should_protect_data() { return 1; }
+should_protect_path() { return 1; }
+is_path_whitelisted() { return 1; }
+_mole_user_cache_owner_process_state() { return 1; }
+_mole_timeout_with_deadline() {
+    [[ ! -f "$exhausted_marker" ]] || return 1
+    printf '2\n'
+}
+lsof() {
+    case "$*" in
+        *"+D $model_parent"*)
+            touch "$exhausted_marker"
+            return 1
+            ;;
+        *"+D $idle_target"*) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+run_with_timeout() { shift; "$@"; }
+get_path_size_kb() { printf '7\n'; }
+register_dry_run_cleanup_target() { printf 'REGISTER=%s\n' "$1"; }
+append_dry_run_cleanup_target() { printf 'APPEND=%s\n' "$1"; }
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+
+exhausted_marker="$HOME/compiled-probe-spent-budget"
+mkdir -p "$model_parent/com.apple.e5rt.e5bundlecache"
+mkdir -p "$idle_target"
+printf 'model\n' > "$model_parent/com.apple.e5rt.e5bundlecache/model.bin"
+printf 'idle\n' > "$idle_target/state.json"
+clean_group_container_caches
+printf 'FILES=%s SIZE=%s ITEMS=%s EXISTS=%s\n' \
+    "$files_cleaned" "$total_size_cleaned" "$total_items" \
+    "$(test -d "$model_parent" && echo yes || echo no)"
+EOF
+
+    rm -rf "$model_home"
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"FILES=1 SIZE=7 ITEMS=1 EXISTS=yes"* ]] || return 1
+    [[ "$output" != *"REGISTER=$model_parent"* ]] || return 1
+    [[ "$output" != *"APPEND=$model_parent"* ]] || return 1
+    [[ "$output" == *"REGISTER=$idle_target"* ]] || return 1
+    [[ "$output" == *"APPEND=$idle_target"* ]] || return 1
+    [[ "$output" == *"Group Containers logs/caches"* ]] || return 1
+}
+
+@test "explicit App Container cleanup families expose one cumulative probe deadline (#1471)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+bytes_to_human() { printf '0B\n'; }
+directory_has_entries() { return 1; }
+clean_support_app_data() { :; }
+safe_clean() {
+    case "${*: -1}" in
+        "Wallpaper agent cache" | "Microsoft Word container cache" | "UTM sandbox cache")
+            [[ -n "${_MOLE_CONTAINER_CACHE_PROBE_DEADLINE+x}" ]] || {
+                printf 'MISSING=%s\n' "${*: -1}"
+                return 99
+            }
+            if [[ -z "$_MOLE_CONTAINER_CACHE_PROBE_DEADLINE" ]]; then
+                _MOLE_CONTAINER_CACHE_PROBE_DEADLINE=4242
+            elif [[ "$_MOLE_CONTAINER_CACHE_PROBE_DEADLINE" != "4242" ]]; then
+                printf 'RESET=%s:%s\n' "${*: -1}" "$_MOLE_CONTAINER_CACHE_PROBE_DEADLINE"
+                return 99
+            fi
+            printf 'SCOPED=%s\n' "${*: -1}"
+            ;;
+    esac
+}
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+
+clean_app_caches
+clean_office_applications
+clean_utm_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"SCOPED=Wallpaper agent cache"* ]] || return 1
+    [[ "$output" == *"SCOPED=Microsoft Word container cache"* ]] || return 1
+    [[ "$output" == *"SCOPED=UTM sandbox cache"* ]] || return 1
+    [[ "$output" != *"MISSING="* ]] || return 1
+    [[ "$output" != *"RESET="* ]] || return 1
+}
+
+@test "process_container_cache counts only items safe_remove actually removed (#1471)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+should_protect_data() { return 1; }
+should_protect_path() { return 1; }
+is_path_whitelisted() { return 1; }
+holds_compiled_model_cache() { return 1; }
+get_path_size_kb() { printf '7\n'; }
+safe_remove() { return 1; }
+
+container="$HOME/Library/Containers/com.example.Failed"
+target="$container/Data/Library/Caches/Live"
+mkdir -p "$target"
+printf 'live\n' > "$target/state.json"
+total_size=0
+total_size_partial=false
+cleaned_count=0
+found_any=false
+precise_size_limit=64
+precise_size_used=0
+process_container_cache "$container"
+printf 'FOUND=%s CLEANED=%s SIZE=%s EXISTS=%s\n' \
+    "$found_any" "$cleaned_count" "$total_size" \
+    "$(test -d "$target" && echo yes || echo no)"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"FOUND=false CLEANED=0 SIZE=0 EXISTS=yes"* ]] || return 1
+}
+
+@test "clean_group_container_caches does not report or count an all-refused large candidate (#1471)" {
+    local refused_home
+    refused_home=$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-refused-group.XXXXXX")
+    run env HOME="$refused_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+should_protect_data() { return 1; }
+should_protect_path() { return 1; }
+is_path_whitelisted() { return 1; }
+safe_remove() { return 1; }
+get_path_size_kb() { printf 'UNEXPECTED_SIZE\n'; return 99; }
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+
+candidate="$HOME/Library/Group Containers/group.com.example.refused/Library/Caches"
+mkdir -p "$candidate"
+for i in $(seq 1 101); do
+    printf 'live\n' > "$candidate/item-$i.jsonl"
+done
+clean_group_container_caches
+remaining=$(find "$candidate" -type f | wc -l | tr -d ' ')
+printf 'FILES=%s SIZE=%s ITEMS=%s REMAINING=%s\n' \
+    "$files_cleaned" "$total_size_cleaned" "$total_items" "$remaining"
+EOF
+
+    rm -rf "$refused_home"
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"FILES=0 SIZE=0 ITEMS=0 REMAINING=101"* ]] || return 1
+    [[ "$output" != *"Group Containers logs/caches"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_SIZE"* ]] || return 1
+}
+
 @test "clean_handoff_pasteboard_cache removes stale items and keeps fresh ones (#1178)" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
@@ -1238,6 +1420,9 @@ start_section_spinner() { :; }
 stop_section_spinner() { :; }
 bytes_to_human() { echo "0B"; }
 note_activity() { :; }
+_mole_user_cache_owner_process_state() { return 1; }
+lsof() { return 1; }
+run_with_timeout() { shift; "$@"; }
 files_cleaned=0
 total_size_cleaned=0
 total_items=0
@@ -1305,7 +1490,10 @@ EOF
 }
 
 @test "clean_group_container_caches does not report when only whitelisted items exist" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false /bin/bash --noprofile --norc << 'EOF'
+    local whitelist_home="$HOME/group-only-whitelisted"
+    mkdir -p "$whitelist_home"
+
+    run env HOME="$whitelist_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"

@@ -893,6 +893,9 @@ directory_has_entries() {
 }
 
 clean_app_caches() {
+    # Every App Container handle probe in this section shares one wall-clock
+    # budget, including the explicit Apple cache rows before the generic scan.
+    local _MOLE_CONTAINER_CACHE_PROBE_DEADLINE=""
     start_section_spinner "Scanning app caches..."
 
     # macOS system caches (merged from clean_macos_system_caches)
@@ -954,10 +957,6 @@ clean_app_caches() {
     local precise_size_limit="${MOLE_CONTAINER_CACHE_PRECISE_SIZE_LIMIT:-64}"
     [[ "$precise_size_limit" =~ ^[0-9]+$ ]] || precise_size_limit=64
     local precise_size_used=0
-    # Recursive lsof probes fail closed after one cumulative section budget;
-    # candidate count cannot multiply the per-command timeout into minutes.
-    local _MOLE_CONTAINER_CACHE_PROBE_DEADLINE=""
-
     local _ng_state
     _ng_state=$(shopt -p nullglob || true)
     shopt -s nullglob
@@ -1080,83 +1079,14 @@ process_container_cache() {
     item_count=$(cache_top_level_entry_count_capped "$cache_dir" 101)
     [[ "$item_count" =~ ^[0-9]+$ ]] || item_count=0
     [[ "$item_count" -eq 0 ]] && return 0
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        local _nullglob_state
-        local _dotglob_state
-        _nullglob_state=$(shopt -p nullglob || true)
-        _dotglob_state=$(shopt -p dotglob || true)
-        shopt -s nullglob dotglob
-
-        local item
-        for item in "$cache_dir"/*; do
-            [[ -e "$item" ]] || continue
-            [[ -L "$item" ]] && continue
-            if holds_compiled_model_cache "$item"; then
-                continue
-            fi
-            if should_protect_path "$item" 2> /dev/null || is_path_whitelisted "$item" 2> /dev/null; then
-                continue
-            fi
-            local item_size_kb=0
-            local size_known=false
-            if [[ "$precise_size_used" -lt "$precise_size_limit" ]]; then
-                local size_rc=0
-                item_size_kb=$(get_path_size_kb "$item" 2> /dev/null) || size_rc=$?
-                if [[ $size_rc -ne 0 ]]; then
-                    _mole_record_clean_cancellation "$size_rc"
-                    # eval: restore shopt state captured by $(shopt -p)
-                    eval "$_nullglob_state"
-                    eval "$_dotglob_state"
-                    return "$size_rc"
-                fi
-                [[ "$item_size_kb" =~ ^[0-9]+$ ]] || item_size_kb=0
-                precise_size_used=$((precise_size_used + 1))
-                size_known=true
-            else
-                total_size_partial=true
-            fi
-
-            # Dry-run bypasses safe_remove, so ask the same deletion funnel
-            # immediately before registering this preview candidate.
-            _mole_reset_process_snapshot
-            if ! validate_path_for_deletion "$item" 2> /dev/null; then
-                continue
-            fi
-
-            if declare -f register_dry_run_cleanup_target > /dev/null 2>&1; then
-                register_dry_run_cleanup_target "$item" || continue
-            fi
-
-            if declare -f append_dry_run_cleanup_target > /dev/null 2>&1; then
-                append_dry_run_cleanup_target "$item" "$item_size_kb" 1 "$size_known"
-            fi
-            total_size=$((total_size + item_size_kb))
-            cleaned_count=$((cleaned_count + 1))
-            found_any=true
-        done
-
-        # eval: restore shopt state captured by $(shopt -p)
-        eval "$_nullglob_state"
-        eval "$_dotglob_state"
-        return 0
-    fi
-
-    if [[ "$item_count" -le 100 && "$precise_size_used" -lt "$precise_size_limit" ]]; then
-        local size=""
-        local size_rc=0
-        size=$(get_path_size_kb "$cache_dir" 2> /dev/null) || size_rc=$?
-        [[ $size_rc -eq 0 ]] || _mole_record_clean_cancellation "$size_rc"
-        [[ $size_rc -eq 0 ]] || return "$size_rc"
-        [[ "$size" =~ ^[0-9]+$ ]] || size=0
-        total_size=$((total_size + size))
-        precise_size_used=$((precise_size_used + 1))
-    else
+    local measure_item_sizes=true
+    if [[ "$item_count" -gt 100 ]]; then
+        # Large containers are intentionally cleanup-only: one du per child
+        # turns a bounded cache sweep into another long recursive scan.
+        measure_item_sizes=false
         total_size_partial=true
     fi
 
-    found_any=true
-    cleaned_count=$((cleaned_count + 1))
     local _nullglob_state
     local _dotglob_state
     _nullglob_state=$(shopt -p nullglob || true)
@@ -1175,7 +1105,52 @@ process_container_cache() {
         if should_protect_path "$item" 2> /dev/null || is_path_whitelisted "$item" 2> /dev/null; then
             continue
         fi
-        safe_remove "$item" true || true
+
+        local item_size_kb=0
+        local size_known=false
+        if [[ "$measure_item_sizes" == "true" && "$precise_size_used" -lt "$precise_size_limit" ]]; then
+            local size_rc=0
+            item_size_kb=$(get_path_size_kb "$item" 2> /dev/null) || size_rc=$?
+            if [[ $size_rc -ne 0 ]]; then
+                _mole_record_clean_cancellation "$size_rc"
+                # eval: restore shopt state captured by $(shopt -p)
+                eval "$_nullglob_state"
+                eval "$_dotglob_state"
+                return "$size_rc"
+            fi
+            [[ "$item_size_kb" =~ ^[0-9]+$ ]] || item_size_kb=0
+            precise_size_used=$((precise_size_used + 1))
+            size_known=true
+        elif [[ "$measure_item_sizes" == "true" ]]; then
+            total_size_partial=true
+        fi
+
+        local action_rc=0
+        if [[ "$DRY_RUN" == "true" ]]; then
+            # Dry-run and real mode share this candidate loop. Preview probes
+            # once here; real mode probes once at safe_remove's final sink.
+            _mole_reset_process_snapshot
+            validate_path_for_deletion "$item" 2> /dev/null || action_rc=$?
+            if [[ $action_rc -eq 0 ]] && declare -f register_dry_run_cleanup_target > /dev/null 2>&1; then
+                register_dry_run_cleanup_target "$item" || action_rc=$?
+            fi
+            if [[ $action_rc -eq 0 ]] && declare -f append_dry_run_cleanup_target > /dev/null 2>&1; then
+                append_dry_run_cleanup_target "$item" "$item_size_kb" 1 "$size_known" || action_rc=$?
+            fi
+        else
+            safe_remove "$item" true "$item_size_kb" || action_rc=$?
+        fi
+        if [[ $action_rc -ge 128 ]]; then
+            _mole_record_clean_cancellation "$action_rc"
+            # eval: restore shopt state captured by $(shopt -p)
+            eval "$_nullglob_state"
+            eval "$_dotglob_state"
+            return "$action_rc"
+        fi
+        [[ $action_rc -eq 0 ]] || continue
+        total_size=$((total_size + item_size_kb))
+        cleaned_count=$((cleaned_count + 1))
+        found_any=true
     done
     # eval: restore shopt state captured by $(shopt -p)
     eval "$_nullglob_state"
@@ -1198,8 +1173,8 @@ clean_group_container_caches() {
     local _MOLE_CONTAINER_CACHE_PROBE_DEADLINE=""
 
     local container_dir
-    local _nullglob_state
-    _nullglob_state=$(shopt -p nullglob || true)
+    local group_nullglob_state
+    group_nullglob_state=$(shopt -p nullglob || true)
     shopt -s nullglob
 
     for container_dir in "$group_containers_dir"/*; do
@@ -1269,66 +1244,79 @@ clean_group_container_caches() {
 
             local candidate_size_kb=0
             local candidate_changed=false
-            local _nullglob_state
-            local _dotglob_state
-            _nullglob_state=$(shopt -p nullglob || true)
-            _dotglob_state=$(shopt -p dotglob || true)
+            local candidate_nullglob_state
+            local candidate_dotglob_state
+            candidate_nullglob_state=$(shopt -p nullglob || true)
+            candidate_dotglob_state=$(shopt -p dotglob || true)
             shopt -s nullglob dotglob
 
+            local candidate_size_known=true
             if [[ "$quick_count" -gt 100 ]]; then
                 total_size_partial=true
-                for item in "$candidate"/*; do
-                    [[ -e "$item" ]] || continue
-                    [[ -L "$item" ]] && continue
-                    if should_protect_path "$item" 2> /dev/null || is_path_whitelisted "$item" 2> /dev/null; then
-                        continue
-                    fi
-                    if [[ "$DRY_RUN" == "true" ]] && declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
-                        _mole_reset_process_snapshot
-                        if ! validate_path_for_deletion "$item" 2> /dev/null; then
-                            continue
-                        fi
-                        record_dry_run_cleanup_target "$item" 0 1 false || continue
-                    fi
-                    candidate_changed=true
-                    if [[ "$DRY_RUN" != "true" ]]; then
-                        safe_remove "$item" true 2> /dev/null || true
-                    fi
-                done
-            else
-                for item in "$candidate"/*; do
-                    [[ -e "$item" ]] || continue
-                    [[ -L "$item" ]] && continue
-                    if should_protect_path "$item" 2> /dev/null || is_path_whitelisted "$item" 2> /dev/null; then
-                        continue
-                    fi
-                    local item_size=""
+                candidate_size_known=false
+            fi
+            for item in "$candidate"/*; do
+                [[ -e "$item" ]] || continue
+                [[ -L "$item" ]] && continue
+                if should_protect_path "$item" 2> /dev/null ||
+                    is_path_whitelisted "$item" 2> /dev/null ||
+                    holds_compiled_model_cache "$item" 2> /dev/null; then
+                    continue
+                fi
+
+                local item_size=0
+                if [[ "$candidate_size_known" == "true" ]]; then
                     local size_rc=0
                     item_size=$(get_path_size_kb "$item" 2> /dev/null) || size_rc=$?
                     [[ $size_rc -eq 0 ]] || _mole_record_clean_cancellation "$size_rc"
-                    [[ $size_rc -eq 0 ]] || return "$size_rc"
+                    if [[ $size_rc -ne 0 ]]; then
+                        # eval: restore shopt state captured by $(shopt -p)
+                        eval "$candidate_nullglob_state"
+                        eval "$candidate_dotglob_state"
+                        eval "$group_nullglob_state"
+                        return "$size_rc"
+                    fi
                     [[ "$item_size" =~ ^[0-9]+$ ]] || item_size=0
-                    if [[ "$DRY_RUN" == "true" ]]; then
-                        _mole_reset_process_snapshot
-                        if ! validate_path_for_deletion "$item" 2> /dev/null; then
-                            continue
-                        fi
-                        if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
-                            record_dry_run_cleanup_target "$item" "$item_size" 1 true || continue
-                        fi
-                        candidate_changed=true
-                        candidate_size_kb=$((candidate_size_kb + item_size))
-                        continue
+                fi
+
+                local action_rc=0
+                if [[ "$DRY_RUN" == "true" ]]; then
+                    _mole_reset_process_snapshot
+                    # Match real safe_remove ordering: a compiled-model cache
+                    # that appeared during sizing is rejected before the
+                    # recursive lsof probe can consume this section's budget.
+                    if holds_compiled_model_cache "$item" 2> /dev/null; then
+                        action_rc=1
                     fi
-                    if safe_remove "$item" true "$item_size" 2> /dev/null; then
-                        candidate_changed=true
-                        candidate_size_kb=$((candidate_size_kb + item_size))
+                    if [[ $action_rc -eq 0 ]]; then
+                        validate_path_for_deletion "$item" 2> /dev/null || action_rc=$?
                     fi
-                done
-            fi
+                    if [[ $action_rc -eq 0 ]] && declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                        # The path, whitelist, compiled-model, live-owner, and
+                        # SQLite guards have all run after sizing. Avoid only
+                        # repeating that complete eligibility pass.
+                        local _MOLE_DRY_RUN_TARGET_PREVALIDATED=true
+                        record_dry_run_cleanup_target \
+                            "$item" "$item_size" 1 "$candidate_size_known" || action_rc=$?
+                    fi
+                else
+                    safe_remove "$item" true "$item_size" 2> /dev/null || action_rc=$?
+                fi
+                if [[ $action_rc -ge 128 ]]; then
+                    _mole_record_clean_cancellation "$action_rc"
+                    # eval: restore shopt state captured by $(shopt -p)
+                    eval "$candidate_nullglob_state"
+                    eval "$candidate_dotglob_state"
+                    eval "$group_nullglob_state"
+                    return "$action_rc"
+                fi
+                [[ $action_rc -eq 0 ]] || continue
+                candidate_changed=true
+                candidate_size_kb=$((candidate_size_kb + item_size))
+            done
             # eval: restore shopt state captured by $(shopt -p)
-            eval "$_nullglob_state"
-            eval "$_dotglob_state"
+            eval "$candidate_nullglob_state"
+            eval "$candidate_dotglob_state"
 
             if [[ "$candidate_changed" == "true" ]]; then
                 total_size=$((total_size + candidate_size_kb))
@@ -1338,7 +1326,7 @@ clean_group_container_caches() {
         done
     done
     # eval: restore shopt state captured by $(shopt -p)
-    eval "$_nullglob_state"
+    eval "$group_nullglob_state"
 
     stop_section_spinner
 
@@ -1838,6 +1826,8 @@ clean_cloud_storage() {
 
 # Office app caches.
 clean_office_applications() {
+    # Bound every explicit Office App Container probe as one section.
+    local _MOLE_CONTAINER_CACHE_PROBE_DEADLINE=""
     if [[ "${MO_DEBUG:-0}" == "1" ]]; then
         echo "[DEBUG] Cleaning office application caches..." >&2
     fi
@@ -1865,6 +1855,7 @@ clean_office_applications() {
 
 # Virtualization caches.
 clean_utm_caches() {
+    local _MOLE_CONTAINER_CACHE_PROBE_DEADLINE=""
     if pgrep -x "UTM" > /dev/null 2>&1; then
         debug_log "Skipping UTM caches while UTM is running"
         return 0

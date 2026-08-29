@@ -91,16 +91,17 @@ func TestCollectProcessesKeepsLiveProcessesWithCachedEnrichment(t *testing.T) {
 	ioCountersFunc = func(bool) ([]gopsutilnet.IOCountersStat, error) {
 		return []gopsutilnet.IOCountersStat{{Name: "en0", BytesRecv: 1024, BytesSent: 2048}}, nil
 	}
-	collectProcessesFunc = func() ([]ProcessInfo, error) {
-		return []ProcessInfo{
+	collectProcessesFunc = func() (processSample, error) {
+		return processSample{processes: []ProcessInfo{
 			{PID: 200, PPID: 1, Name: "new-hot-process", Command: "/usr/bin/new-hot-process", CPU: 240, Memory: 1.5},
 			{PID: 201, PPID: 200, State: "Z+", Name: "defunct-child", Command: "defunct-child"},
-		}, nil
+		}, parentsAvailable: true}, nil
 	}
 
 	collector := NewCollector(ProcessWatchOptions{Enabled: true, CPUThreshold: 50})
 	cachedZombieCount := 7
-	collector.cacheEnrichment(MetricsSnapshot{
+	cachedParentsComplete := true
+	cached := MetricsSnapshot{
 		Hardware:  HardwareInfo{Model: "MacBook Pro"},
 		TrashSize: 99,
 		TopProcesses: []ProcessInfo{
@@ -110,10 +111,13 @@ func TestCollectProcessesKeepsLiveProcessesWithCachedEnrichment(t *testing.T) {
 		ZombieParents: []ZombieParent{
 			{PID: 100, Name: "old-process", Count: 7},
 		},
+		ZombieParentsComplete: &cachedParentsComplete,
 		ProcessAlerts: []ProcessAlert{
 			{PID: 100, Name: "old-process", Status: "active"},
 		},
-	})
+	}
+	collector.cacheEnrichment(cached)
+	collector.cacheProcessEnrichment(cached)
 
 	snapshot, err := collector.CollectProcesses()
 	if err != nil {
@@ -132,16 +136,30 @@ func TestCollectProcessesKeepsLiveProcessesWithCachedEnrichment(t *testing.T) {
 	if snapshot.ZombieCount == nil || *snapshot.ZombieCount != 1 || len(snapshot.ZombieParents) != 1 || snapshot.ZombieParents[0].PID != 200 {
 		t.Fatalf("expected live zombie summary, got count=%v parents=%#v", snapshot.ZombieCount, snapshot.ZombieParents)
 	}
+	if snapshot.ZombieParentsComplete == nil || !*snapshot.ZombieParentsComplete {
+		t.Fatalf("expected complete live parent attribution, got %v", snapshot.ZombieParentsComplete)
+	}
+
+	fastSnapshot, err := collector.CollectFast()
+	if err != nil {
+		t.Fatalf("CollectFast() error = %v", err)
+	}
+	if fastSnapshot.ZombieCount == nil || *fastSnapshot.ZombieCount != 1 ||
+		len(fastSnapshot.ZombieParents) != 1 || fastSnapshot.ZombieParents[0].PID != 200 {
+		t.Fatalf("fast refresh restored stale zombies: count=%v parents=%#v", fastSnapshot.ZombieCount, fastSnapshot.ZombieParents)
+	}
 }
 
-func TestCacheEnrichmentPreservesLatestMeasuredZombieSummary(t *testing.T) {
+func TestSlowEnrichmentDoesNotReplaceLatestProcessSummary(t *testing.T) {
 	collector := NewCollector(ProcessWatchOptions{})
 	measured := 3
-	collector.cacheEnrichment(MetricsSnapshot{
+	complete := true
+	collector.cacheProcessEnrichment(MetricsSnapshot{
 		ZombieCount: &measured,
 		ZombieParents: []ZombieParent{
 			{PID: 42, Name: "Chrome", Count: 3},
 		},
+		ZombieParentsComplete: &complete,
 	})
 
 	collector.cacheEnrichment(MetricsSnapshot{Hardware: HardwareInfo{Model: "newer enrichment"}})
@@ -153,5 +171,8 @@ func TestCacheEnrichmentPreservesLatestMeasuredZombieSummary(t *testing.T) {
 	}
 	if len(snapshot.ZombieParents) != 1 || snapshot.ZombieParents[0].PID != 42 {
 		t.Fatalf("latest measured zombie parents were not preserved: %#v", snapshot.ZombieParents)
+	}
+	if snapshot.ZombieParentsComplete == nil || !*snapshot.ZombieParentsComplete {
+		t.Fatalf("latest parent completeness was not preserved: %v", snapshot.ZombieParentsComplete)
 	}
 }

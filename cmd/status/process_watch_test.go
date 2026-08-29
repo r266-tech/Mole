@@ -35,12 +35,15 @@ func TestCollectProcessesUnderCommaLocale(t *testing.T) {
 	t.Setenv("LC_ALL", "ru_RU.UTF-8")
 	t.Setenv("LC_NUMERIC", "ru_RU.UTF-8")
 
-	procs, err := collectProcesses()
+	sample, err := collectProcesses()
 	if err != nil {
 		t.Fatalf("collectProcesses() error = %v", err)
 	}
-	if len(procs) == 0 {
+	if len(sample.processes) == 0 {
 		t.Fatal("collectProcesses() returned no processes under a comma-decimal locale")
+	}
+	if !sample.parentsAvailable {
+		t.Fatal("primary process sample should include parent metadata")
 	}
 }
 
@@ -82,65 +85,53 @@ func TestParsePrimaryProcessOutputStrictAcceptsCurrentDarwinOutput(t *testing.T)
 	}
 }
 
-func TestParseProcessOutput(t *testing.T) {
-	raw := strings.Join([]string{
-		"123 1 145.2 10.1 7340032 /Applications/Visual Studio Code.app/Contents/MacOS/Electron",
-		"456 1 99.5 2.2 262144 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder",
-		"bad line",
-	}, "\n")
+func TestCollectProcessesMarksFallbackParentAttributionIncomplete(t *testing.T) {
+	originalRunCmd := runCmd
+	t.Cleanup(func() { runCmd = originalRunCmd })
 
-	procs := parseProcessOutput(raw)
-	if len(procs) != 2 {
-		t.Fatalf("parseProcessOutput() len = %d, want 2", len(procs))
+	runCmd = func(_ context.Context, _ string, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "-Aceo" {
+			return "malformed primary output", nil
+		}
+		return strings.Join([]string{
+			"USER PID %CPU %MEM VSZ RSS TT STAT STARTED TIME COMMAND",
+			"raj 11 0.0 0.0 0 0 ?? Z+ 10:00AM 0:00 child <defunct>",
+		}, "\n"), nil
 	}
 
-	if procs[0].PID != 123 || procs[0].PPID != 1 {
-		t.Fatalf("unexpected pid/ppid: %+v", procs[0])
+	sample, err := collectProcesses()
+	if err != nil {
+		t.Fatalf("collectProcesses() error = %v", err)
 	}
-	if procs[0].Name != "Electron" {
-		t.Fatalf("unexpected process name %q", procs[0].Name)
+	if sample.parentsAvailable {
+		t.Fatal("ps aux fallback should not claim parent metadata")
 	}
-	if !strings.Contains(procs[0].Command, "Visual Studio Code.app") {
-		t.Fatalf("command path missing spaces: %q", procs[0].Command)
-	}
-	if procs[0].MemoryBytes != 7340032*1024 {
-		t.Fatalf("unexpected memory bytes %d", procs[0].MemoryBytes)
+	if len(sample.processes) != 1 || !isZombieState(sample.processes[0].State) {
+		t.Fatalf("unexpected fallback sample: %#v", sample.processes)
 	}
 }
 
-func TestParseProcessOutputKeepsOldFiveColumnShape(t *testing.T) {
-	raw := "123 1 145.2 10.1 /Applications/Visual Studio Code.app/Contents/MacOS/Electron"
-
-	procs := parseProcessOutput(raw)
-	if len(procs) != 1 {
-		t.Fatalf("parseProcessOutput() len = %d, want 1", len(procs))
-	}
-	if procs[0].Memory != 10.1 {
-		t.Fatalf("unexpected memory percent %.1f", procs[0].Memory)
-	}
-	if procs[0].MemoryBytes != 0 {
-		t.Fatalf("old ps shape should not invent memory bytes, got %d", procs[0].MemoryBytes)
-	}
-	if procs[0].Command != "/Applications/Visual Studio Code.app/Contents/MacOS/Electron" {
-		t.Fatalf("unexpected command %q", procs[0].Command)
-	}
-}
-
-func TestParseProcessOutputCapturesZombieState(t *testing.T) {
+func TestParseProcessOutputStrictCapturesStateAndResidentMemory(t *testing.T) {
 	raw := strings.Join([]string{
 		"123 10 Z+ 0.0 0.0 0 worker <defunct>",
 		"456 10 S 1.5 0.2 1024 /usr/bin/worker",
 	}, "\n")
 
-	procs := parseProcessOutput(raw)
+	procs, err := parseProcessOutputStrict(raw)
+	if err != nil {
+		t.Fatalf("parseProcessOutputStrict() error = %v", err)
+	}
 	if len(procs) != 2 {
-		t.Fatalf("parseProcessOutput() len = %d, want 2", len(procs))
+		t.Fatalf("parseProcessOutputStrict() len = %d, want 2", len(procs))
 	}
 	if procs[0].State != "Z+" {
 		t.Fatalf("zombie state = %q, want Z+", procs[0].State)
 	}
 	if procs[1].State != "S" {
 		t.Fatalf("ordinary state = %q, want S", procs[1].State)
+	}
+	if procs[1].MemoryBytes != 1024*1024 {
+		t.Fatalf("resident memory = %d, want %d", procs[1].MemoryBytes, 1024*1024)
 	}
 }
 
@@ -150,9 +141,12 @@ func TestParsePsAuxOutputCapturesResidentMemory(t *testing.T) {
 		"raj 123 4.5 6.0 123456 2097152 ?? S 10:00AM 1:23 /Applications/Chrome.app/Contents/MacOS/Chrome --type=renderer",
 	}, "\n")
 
-	procs := parsePsAuxOutput(raw)
+	procs, err := parsePsAuxOutputStrict(raw)
+	if err != nil {
+		t.Fatalf("parsePsAuxOutputStrict() error = %v", err)
+	}
 	if len(procs) != 1 {
-		t.Fatalf("parsePsAuxOutput() len = %d, want 1", len(procs))
+		t.Fatalf("parsePsAuxOutputStrict() len = %d, want 1", len(procs))
 	}
 	if procs[0].MemoryBytes != 2097152*1024 {
 		t.Fatalf("unexpected memory bytes %d", procs[0].MemoryBytes)
@@ -176,12 +170,15 @@ func TestFallbackCountsZombiesWithoutGuessingParents(t *testing.T) {
 		t.Fatalf("parsePsAuxOutputStrict() error = %v", err)
 	}
 
-	count, parents := summarizeZombies(procs, 3)
+	count, parents, complete := summarizeZombies(procs, 3, false)
 	if count != 1 {
 		t.Fatalf("fallback zombie count = %d, want 1", count)
 	}
 	if len(parents) != 0 {
 		t.Fatalf("fallback should omit unknown parent detail, got %#v", parents)
+	}
+	if complete {
+		t.Fatal("fallback parent attribution should be marked incomplete")
 	}
 }
 
@@ -215,7 +212,7 @@ func TestStrictProcessParsersRejectPartialTables(t *testing.T) {
 }
 
 func TestProcessStateTokenGrammar(t *testing.T) {
-	for _, state := range []string{"D", "I", "R", "S", "T", "U", "W", "Z", "Z+", "Ss", "R<", "SN+", "S>", "RE", "SV", "RX", "SAW"} {
+	for _, state := range []string{"?", "?+", "?E", "D", "I", "R", "S", "T", "U", "W", "Z", "Z+", "Ss", "R<", "SN+", "S>", "RE", "SV", "RX", "SAW"} {
 		if !isProcessStateToken(state) {
 			t.Fatalf("isProcessStateToken(%q) = false, want true", state)
 		}
@@ -238,7 +235,7 @@ func TestSummarizeZombiesCountsAndRanksKnownParents(t *testing.T) {
 		{PID: 105, PPID: 10, State: "S", Name: "live-child"},
 	}
 
-	count, parents := summarizeZombies(processes, 3)
+	count, parents, complete := summarizeZombies(processes, 3, true)
 	if count != 4 {
 		t.Fatalf("zombie count = %d, want 4", count)
 	}
@@ -251,10 +248,16 @@ func TestSummarizeZombiesCountsAndRanksKnownParents(t *testing.T) {
 	if parents[1] != (ZombieParent{PID: 20, Name: "zsh", Count: 1}) {
 		t.Fatalf("second zombie parent = %#v", parents[1])
 	}
+	if complete {
+		t.Fatal("missing parent row should mark attribution incomplete")
+	}
 
-	_, limited := summarizeZombies(processes, 1)
+	_, limited, limitedComplete := summarizeZombies(processes, 1, true)
 	if len(limited) != 1 || limited[0].PID != 10 {
 		t.Fatalf("limited zombie parents = %#v", limited)
+	}
+	if limitedComplete {
+		t.Fatal("truncated parent list should be marked incomplete")
 	}
 }
 
@@ -400,6 +403,7 @@ func TestRenderProcessAlertBar(t *testing.T) {
 
 func TestMetricsSnapshotJSONIncludesProcessWatch(t *testing.T) {
 	zombieCount := 2
+	zombieParentsComplete := true
 	snapshot := MetricsSnapshot{
 		ZombieCount: &zombieCount,
 		ZombieParents: []ZombieParent{{
@@ -407,6 +411,7 @@ func TestMetricsSnapshotJSONIncludesProcessWatch(t *testing.T) {
 			Name:  "Chrome",
 			Count: 2,
 		}},
+		ZombieParentsComplete: &zombieParentsComplete,
 		ProcessWatch: ProcessWatchConfig{
 			Enabled:      true,
 			CPUThreshold: 100,
@@ -433,7 +438,8 @@ func TestMetricsSnapshotJSONIncludesProcessWatch(t *testing.T) {
 	if !strings.Contains(out, "\"process_alerts\"") {
 		t.Fatalf("missing process_alerts in json: %s", out)
 	}
-	if !strings.Contains(out, "\"zombie_count\":2") || !strings.Contains(out, "\"zombie_parents\"") {
+	if !strings.Contains(out, "\"zombie_count\":2") || !strings.Contains(out, "\"zombie_parents\"") ||
+		!strings.Contains(out, "\"zombie_parents_complete\":true") {
 		t.Fatalf("missing zombie summary in json: %s", out)
 	}
 }
@@ -443,16 +449,19 @@ func TestMetricsSnapshotJSONDistinguishesUnmeasuredFromZeroZombies(t *testing.T)
 	if err != nil {
 		t.Fatalf("json.Marshal(unmeasured) error = %v", err)
 	}
-	if strings.Contains(string(unmeasured), "\"zombie_count\"") {
-		t.Fatalf("unmeasured snapshot should omit zombie_count: %s", unmeasured)
+	if strings.Contains(string(unmeasured), "\"zombie_count\"") ||
+		strings.Contains(string(unmeasured), "\"zombie_parents_complete\"") {
+		t.Fatalf("unmeasured snapshot should omit zombie measurements: %s", unmeasured)
 	}
 
 	zero := 0
-	measured, err := json.Marshal(MetricsSnapshot{ZombieCount: &zero})
+	complete := true
+	measured, err := json.Marshal(MetricsSnapshot{ZombieCount: &zero, ZombieParentsComplete: &complete})
 	if err != nil {
 		t.Fatalf("json.Marshal(measured) error = %v", err)
 	}
-	if !strings.Contains(string(measured), "\"zombie_count\":0") {
+	if !strings.Contains(string(measured), "\"zombie_count\":0") ||
+		!strings.Contains(string(measured), "\"zombie_parents_complete\":true") {
 		t.Fatalf("measured zero snapshot should include zombie_count: %s", measured)
 	}
 }

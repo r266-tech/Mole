@@ -266,9 +266,9 @@ Read    ▮▯▯▯▯  2.1 MB/s                  Health  Normal · 423 cycles
 Write   ▮▮▮▯▯  18.3 MB/s                 Temp    58°C · 1200 RPM
 
 ⇅ Network                                ▶ Processes
-Down    ▁▁█▂▁▁▁▁▁▁▁▁▇▆▅▂  0.54 MB/s      Code       ▮▮▮▮▯  42.1%
-Up      ▄▄▄▃▃▃▄▆▆▇█▁▁▁▁▁  0.02 MB/s      Chrome     ▮▮▮▯▯  28.3%
-Proxy   HTTP · 192.168.1.100             Terminal   ▮▯▯▯▯  12.5%
+Down    ▁▁█▂▁▁▁▁▁▁▁▁▇▆▅▂  0.54 MB/s      Zombies 3 · Chrome (4242) ×3
+Up      ▄▄▄▃▃▃▄▆▆▇█▁▁▁▁▁  0.02 MB/s      Code       ▮▮▮▮▯  42.1%
+Proxy   HTTP · 192.168.1.100             Chrome     ▮▮▮▯▯  28.3%
 ```
 
 The health score combines CPU, memory, disk capacity, SMART status, I/O, thermals, battery state, and uptime, with color-coded ranges. Press `k` to toggle the cat, `c` to cycle the number of CPU cores shown, or `q` to quit. Display preferences are saved.
@@ -304,9 +304,19 @@ $ mo status --json
   "cpu": { "usage": 45.2, "logical_cpu": 8 },
   "memory": { "total": 34359738368, "used": 20078972109, "used_percent": 58.4 },
   "disks": [],
+  "zombie_count": 3,
+  "zombie_parents": [
+    { "pid": 4242, "name": "Google Chrome for Testing", "count": 3 }
+  ],
+  "zombie_parents_complete": true,
   "uptime": "3d 12h 45m"
 }
 ```
+
+Zombie diagnostics are read-only and do not affect the health score or terminate processes. If
+process collection does not complete, `zombie_count` and `zombie_parents_complete` are omitted. A
+count of `0` means Mole measured no zombies. Parent summaries contain at most three known owners;
+`zombie_parents_complete: false` means some owners were unavailable or omitted.
 
 Status also supports read-only alerts for processes that stay above a CPU threshold. Use `--proc-cpu-threshold`, `--proc-cpu-window`, or `--proc-cpu-alerts=false` to tune or disable them.
 

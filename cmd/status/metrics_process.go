@@ -72,7 +72,7 @@ func parseProcessOutputStrict(raw string) ([]ProcessInfo, error) {
 			PID:         pid,
 			PPID:        ppid,
 			State:       fields[2],
-			Name:        processNameFromCommand(command),
+			Name:        processNameFromComm(command),
 			Command:     command,
 			CPU:         cpuVal,
 			Memory:      memVal,
@@ -197,6 +197,14 @@ func summarizeZombies(processes []ProcessInfo, limit int, parentsAvailable bool)
 		complete = false
 	}
 	return count, parents, complete
+}
+
+func processNameFromComm(command string) string {
+	name := command
+	if idx := strings.LastIndex(name, "/"); idx >= 0 {
+		name = name[idx+1:]
+	}
+	return strings.TrimSpace(name)
 }
 
 func processNameFromCommand(command string) string {

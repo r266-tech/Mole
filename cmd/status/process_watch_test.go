@@ -135,6 +135,28 @@ func TestParseProcessOutputStrictCapturesStateAndResidentMemory(t *testing.T) {
 	}
 }
 
+func TestPrimaryProcessOutputPreservesMultiwordZombieParentName(t *testing.T) {
+	raw := strings.Join([]string{
+		"123 1 S 0.0 0.1 1024 /Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge Helper (Renderer)",
+		"456 123 Z 0.0 0.0 0 child <defunct>",
+	}, "\n")
+
+	procs, err := parseProcessOutputStrict(raw)
+	if err != nil {
+		t.Fatalf("parseProcessOutputStrict() error = %v", err)
+	}
+	count, parents, complete := summarizeZombies(procs, zombieParentLimit, true)
+	if count != 1 || len(parents) != 1 {
+		t.Fatalf("unexpected zombie summary: count=%d parents=%#v", count, parents)
+	}
+	if parents[0] != (ZombieParent{PID: 123, Name: "Microsoft Edge Helper (Renderer)", Count: 1}) {
+		t.Fatalf("zombie parent = %#v", parents[0])
+	}
+	if !complete {
+		t.Fatal("complete primary process table should preserve complete parent attribution")
+	}
+}
+
 func TestParsePsAuxOutputCapturesResidentMemory(t *testing.T) {
 	raw := strings.Join([]string{
 		"USER PID %CPU %MEM VSZ RSS TT STAT STARTED TIME COMMAND",

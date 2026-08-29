@@ -313,10 +313,11 @@ $ mo status --json
 }
 ```
 
-Zombie diagnostics are read-only and do not affect the health score or terminate processes. If
-process collection does not complete, `zombie_count` and `zombie_parents_complete` are omitted. A
-count of `0` means Mole measured no zombies. Parent summaries contain at most three known owners;
-`zombie_parents_complete: false` means some owners were unavailable or omitted.
+Zombie diagnostics are read-only and do not affect the health score or terminate processes. Before
+Mole has a successful process sample, `zombie_count` and `zombie_parents_complete` are omitted and
+`zombie_parents` is `null`; later fast/watch snapshots reuse the latest successful sample. A count
+of `0` means Mole measured no zombies. Parent summaries contain at most three known owners;
+`zombie_parents_complete: false` means attribution was unavailable, incomplete, or truncated.
 
 Status also supports read-only alerts for processes that stay above a CPU threshold. Use `--proc-cpu-threshold`, `--proc-cpu-window`, or `--proc-cpu-alerts=false` to tune or disable them.
 

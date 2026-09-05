@@ -151,6 +151,10 @@ _uninstall_lproj_candidates() {
 }
 
 readonly MOLE_UNINSTALL_PREFERRED_LANGS="$(mole_uninstall_preferred_languages)"
+# Display names depend on the ordered language list. Keep the fingerprint in
+# each cache row so a language change invalidates only the derived name while
+# size and last-used metadata remain reusable.
+readonly MOLE_UNINSTALL_LANGUAGE_SIGNATURE="$(printf '%s' "$MOLE_UNINSTALL_PREFERRED_LANGS" | cksum | awk '{print $1 ":" $2}')"
 
 # The bundle's own name for a locale, read from the same InfoPlist.strings that
 # Finder consults. Prints nothing when the bundle does not localize the name,
@@ -382,7 +386,7 @@ start_uninstall_metadata_refresh() {
         local -a worker_pids=()
         local worker_idx=0
 
-        while IFS='|' read -r app_path app_mtime bundle_id display_name; do
+        while IFS='|' read -r app_path app_mtime bundle_id display_name language_signature; do
             [[ -n "$app_path" && -d "$app_path" ]] || continue
             ((worker_idx++))
             local worker_output="${updates_file}.${worker_idx}"
@@ -406,7 +410,7 @@ start_uninstall_metadata_refresh() {
                 size_kb=$(get_path_size_kb "$app_path")
                 [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
 
-                printf "%s|%s|%s|%s|%s|%s|%s\n" "$app_path" "${app_mtime:-0}" "$size_kb" "${last_used_epoch:-0}" "$now_epoch" "$bundle_id" "$display_name" > "$worker_output"
+                printf "%s|%s|%s|%s|%s|%s|%s|%s\n" "$app_path" "${app_mtime:-0}" "$size_kb" "${last_used_epoch:-0}" "$now_epoch" "$bundle_id" "$display_name" "$language_signature" > "$worker_output"
             ) < /dev/null &
             worker_pids+=($!)
 
@@ -766,22 +770,24 @@ _scan_partition_cache() {
     }
 
     if [[ -s "$discovered_file" ]]; then
-        awk -F'|' -v cached_out="$cached_rows_file" -v uncached_out="$uncached_rows_file" '
+        awk -F'|' -v cached_out="$cached_rows_file" -v uncached_out="$uncached_rows_file" -v language_signature="$MOLE_UNINSTALL_LANGUAGE_SIGNATURE" '
             FILENAME == ARGV[1] {
                 cache_mtime[$1] = $2
                 cache_size[$1] = $3
                 cache_bundle[$1] = $6
                 cache_display[$1] = $7
+                cache_language[$1] = $8
                 next
             }
             {
                 path = $1
                 app_mtime = $3
-                if (cache_mtime[path] == app_mtime && cache_display[path] != "" && cache_size[path] ~ /^[0-9]+$/ && cache_size[path] > 0) {
+                if (cache_mtime[path] == app_mtime && cache_display[path] != "" && cache_language[path] == language_signature && cache_size[path] ~ /^[0-9]+$/ && cache_size[path] > 0) {
                     cached_bundle = cache_bundle[path] == "" ? "unknown" : cache_bundle[path]
                     print path "|" app_mtime "|" cached_bundle "|" cache_display[path] "|" cache_size[path] >> cached_out
                 } else {
-                    print path "|" $2 "|" app_mtime "|" cache_bundle[path] "|" cache_display[path] >> uncached_out
+                    cached_display = cache_language[path] == language_signature ? cache_display[path] : ""
+                    print path "|" $2 "|" app_mtime "|" cache_bundle[path] "|" cached_display >> uncached_out
                 }
             }
         ' "$cache_source" "$discovered_file"
@@ -978,14 +984,15 @@ _scan_finalize_index() {
             cache_updated[$1] = $5
             cache_bundle[$1] = $6
             cache_display[$1] = $7
+            cache_language[$1] = $8
             next
         }
         {
-            print $0 "|" cache_mtime[$1] "|" cache_size[$1] "|" cache_epoch[$1] "|" cache_updated[$1] "|" cache_bundle[$1] "|" cache_display[$1]
+            print $0 "|" cache_mtime[$1] "|" cache_size[$1] "|" cache_epoch[$1] "|" cache_updated[$1] "|" cache_bundle[$1] "|" cache_display[$1] "|" cache_language[$1]
         }
     ' "$cache_source" "$scan_raw_file" > "$merged_file"
     if [[ ! -s "$merged_file" && -s "$scan_raw_file" ]]; then
-        awk '{print $0 "||||||"}' "$scan_raw_file" > "$merged_file"
+        awk '{print $0 "|||||||"}' "$scan_raw_file" > "$merged_file"
     fi
 
     local current_epoch
@@ -999,6 +1006,7 @@ _scan_finalize_index() {
         -v now="$current_epoch" \
         -v floor="$MOLE_UNINSTALL_EPOCH_FLOOR" \
         -v ttl="$MOLE_UNINSTALL_META_REFRESH_TTL" \
+        -v language_signature="$MOLE_UNINSTALL_LANGUAGE_SIGNATURE" \
         -v refresh_out="$refresh_file" \
         -v snapshot_out="$cache_snapshot_file" \
         -v apps_out="$temp_file" '
@@ -1064,6 +1072,7 @@ _scan_finalize_index() {
                     cached_updated_epoch = $9
                     cached_bundle_id = $10
                     cached_display_name = $11
+                    cached_language_signature = $12
                 } else {
                     inline_size_kb = 0
                     cached_mtime = $5
@@ -1072,6 +1081,7 @@ _scan_finalize_index() {
                     cached_updated_epoch = $8
                     cached_bundle_id = $9
                     cached_display_name = $10
+                    cached_language_signature = ""
                 }
 
                 cache_match = (cached_mtime != "" && app_mtime != "" && cached_mtime == app_mtime)
@@ -1102,16 +1112,18 @@ _scan_finalize_index() {
                     needs_refresh = 1
                 } else if (cached_bundle_id == "" || cached_display_name == "") {
                     needs_refresh = 1
+                } else if (cached_language_signature != language_signature) {
+                    needs_refresh = 1
                 } else if ((now - cached_updated_epoch) > ttl) {
                     needs_refresh = 1
                 }
 
                 if (needs_refresh) {
-                    print app_path "|" app_mtime "|" bundle_id "|" display_name >> refresh_out
+                    print app_path "|" app_mtime "|" bundle_id "|" display_name "|" language_signature >> refresh_out
                 }
 
                 persist_updated_epoch = (isnum(cached_updated_epoch) && cached_updated_epoch > 0) ? cached_updated_epoch : 0
-                print app_path "|" app_mtime "|" final_size_kb "|" final_epoch "|" persist_updated_epoch "|" bundle_id "|" display_name >> snapshot_out
+                print app_path "|" app_mtime "|" final_size_kb "|" final_epoch "|" persist_updated_epoch "|" bundle_id "|" display_name "|" language_signature >> snapshot_out
                 print final_epoch "|" app_path "|" display_name "|" bundle_id "|" final_size "|" final_last_used "|" final_size_kb >> apps_out
             }
         ' "$merged_file"

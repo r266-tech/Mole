@@ -87,15 +87,10 @@ PLIST
 
 	# Seed the warm metadata cache so that the one discovered app
 	# (TestApp.app) is a cache hit: matching mtime, non-empty bundle id
-	# and display name are the conditions the awk classifier and
+	# and display name, plus a matching language signature, are the conditions
+	# the awk classifier and
 	# use_cached_scan_metadata require for the cached branch to "stick".
 	app_mtime="$(stat -f %m "$apps_root/TestApp.app")"
-	cache_dir="$HOME/.cache/mole"
-	mkdir -p "$cache_dir"
-	printf '%s|%s|4|0|0|com.test.TestApp|TestApp\n' \
-		"$apps_root/TestApp.app" "$app_mtime" \
-		> "$cache_dir/uninstall_app_metadata_v2"
-
 	done_marker="$HOME/scan.done"
 
 	# The bug not only emits "unbound variable"; the spinner subshell can
@@ -107,12 +102,19 @@ PLIST
 	(
 		env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
 			MOLE_TEST_NO_AUTH=1 \
-			APPS_ROOT="$apps_root" SRC_PATH="$src" \
+			APPS_ROOT="$apps_root" APP_MTIME="$app_mtime" SRC_PATH="$src" \
 			/bin/bash --noprofile --norc <<'EOF' > "$HOME/scan.out" 2> "$HOME/scan.err"
 set -euo pipefail
 
 # shellcheck source=/dev/null
 source "$SRC_PATH"
+
+# Seed the production cache schema after sourcing so the language signature
+# exactly matches the preference snapshot used by this scan.
+mkdir -p "$MOLE_UNINSTALL_META_CACHE_DIR"
+printf '%s|%s|4|0|0|com.test.TestApp|TestApp|%s\n' \
+	"$APPS_ROOT/TestApp.app" "$APP_MTIME" "$MOLE_UNINSTALL_LANGUAGE_SIGNATURE" \
+	> "$MOLE_UNINSTALL_META_CACHE_FILE"
 
 # Skip the real pkgutil receipt scan: it walks every package on the host and
 # can take longer than this test's watchdog on machines with large receipt
@@ -127,8 +129,13 @@ uninstall_print_app_search_dirs() { printf '%s\n' "$APPS_ROOT"; }
 # Bundle-id resolution would otherwise call /usr/bin/mdls and reject our
 # placeholder Info.plist. The cached branch only needs an echo-through here.
 uninstall_resolve_eligible_bundle_id() { printf '%s\n' "${2:-${1##*/}}"; }
+uninstall_resolve_display_name() {
+	: > "$HOME/name-resolved"
+	printf 'TestApp\n'
+}
 
 scan_applications > /dev/null
+[[ ! -e "$HOME/name-resolved" ]] || exit 2
 EOF
 		: > "$done_marker"
 	) &
@@ -161,6 +168,71 @@ EOF
 	# the inverted status explicitly so the assertion is portable.
 	run grep -q 'unbound variable' "$HOME/scan.err"
 	[ "$status" -ne 0 ]
+}
+
+@test "scan_applications refreshes only a cached localized name when AppleLanguages changes (#1520)" {
+	src="$HOME/uninstall_source.sh"
+	sourceable_uninstall_sh "$src"
+
+	apps_root="$HOME/Applications"
+	app_path="$apps_root/VideoFusion-macOS.app"
+	create_test_app_bundle "$app_path" "com.example.VideoFusion" "VideoFusion-macOS"
+	/usr/libexec/PlistBuddy -c "Add :CFBundleDevelopmentRegion string en" \
+		"$app_path/Contents/Info.plist"
+	mkdir -p "$app_path/Contents/Resources/en.lproj"
+	printf '"CFBundleDisplayName" = "VideoFusion";\n' \
+		> "$app_path/Contents/Resources/en.lproj/InfoPlist.strings"
+	app_mtime="$(stat -f %m "$app_path")"
+
+	bin_dir="$HOME/bin"
+	mkdir -p "$bin_dir"
+	cat > "$bin_dir/defaults" <<'EOF'
+#!/bin/sh
+printf '(\n    "en-CN",\n    "zh-Hans-CN"\n)\n'
+EOF
+	chmod +x "$bin_dir/defaults"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PATH="$bin_dir:$PATH" \
+		MOLE_TEST_NO_AUTH=1 APPS_ROOT="$apps_root" APP_PATH="$app_path" \
+		APP_MTIME="$app_mtime" SRC_PATH="$src" \
+		/bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$SRC_PATH"
+
+uninstall_print_app_search_dirs() { printf '%s\n' "$APPS_ROOT"; }
+pkg_receipt_nonstandard_app_paths() { return 0; }
+uninstall_quick_app_size_kb() { printf '0\n'; }
+uninstall_inline_du_size_kb() { printf '0\n'; }
+start_uninstall_metadata_refresh() { :; }
+
+mkdir -p "$MOLE_UNINSTALL_META_CACHE_DIR"
+printf '%s|%s|4096|1700000000|1700000001|com.example.VideoFusion|剪映专业版|old-language-signature\n' \
+	"$APP_PATH" "$APP_MTIME" > "$MOLE_UNINSTALL_META_CACHE_FILE"
+
+apps_file=$(scan_applications)
+result=$(cat "$apps_file")
+[[ "$result" == *"|$APP_PATH|VideoFusion|com.example.VideoFusion|4.2MB|"* ]] || {
+	printf 'unexpected scan result: %s\n' "$result" >&2
+	exit 1
+}
+[[ "$result" != *"剪映专业版"* ]] || exit 2
+
+IFS='|' read -r cached_path cached_mtime cached_size cached_epoch cached_updated \
+	cached_bundle cached_name cached_language < "$MOLE_UNINSTALL_META_CACHE_FILE"
+[[ "$cached_path" == "$APP_PATH" ]] || exit 3
+[[ "$cached_mtime" == "$APP_MTIME" ]] || exit 4
+[[ "$cached_size" == "4096" ]] || exit 5
+[[ "$cached_epoch" == "1700000000" ]] || exit 6
+[[ "$cached_updated" == "1700000001" ]] || exit 7
+[[ "$cached_bundle" == "com.example.VideoFusion" ]] || exit 8
+[[ "$cached_name" == "VideoFusion" ]] || exit 9
+[[ -n "$cached_language" && "$cached_language" != "old-language-signature" ]] || exit 10
+EOF
+
+	[ "$status" -eq 0 ] || {
+		echo "$output"
+		return 1
+	}
 }
 
 @test "app discovery treats the app suffix case-insensitively without admitting nested bundles" {

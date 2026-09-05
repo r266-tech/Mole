@@ -1064,7 +1064,15 @@ _scan_finalize_index() {
                 display_name = $2
                 bundle_id = $3
                 app_mtime = $4
-                if (NF >= 11) {
+                # A merged row is the 5-field scan row plus the 7 cache fields
+                # appended above, so 12 is the only width the current writers
+                # produce. The threshold has to track that sum: while the cache
+                # block was 6 fields wide, 11 named the same shape, and leaving
+                # it at 11 after the language signature landed would have let a
+                # hypothetical 11-field row take this branch and read every
+                # cached_* value shifted by one, so the signature itself would
+                # render as the display name.
+                if (NF >= 12) {
                     inline_size_kb = $5
                     cached_mtime = $6
                     cached_size_kb = $7

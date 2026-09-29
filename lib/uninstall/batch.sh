@@ -2238,7 +2238,10 @@ _batch_execute_removals() {
                     _du_total=$(run_with_timeout "$MOLE_TIMEOUT_DISK_VERIFY_SEC" \
                         du -skcP "${leftover_paths[@]}" 2> /dev/null | awk 'END {print $1}') || _du_rc=$?
                     mole_rc_timeout_or_signal "$_du_rc" && return "$_du_rc"
-                    if [[ $_du_rc -eq 0 && "$_du_total" =~ ^[0-9]+$ ]]; then
+                    # du still prints a partial total when a retained path is
+                    # unreadable. Exclude those measured bytes even on failure;
+                    # a permission error must not count them as freed space.
+                    if [[ "$_du_total" =~ ^[0-9]+$ ]]; then
                         leftover_kb=$_du_total
                     fi
                 fi

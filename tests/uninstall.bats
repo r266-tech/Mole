@@ -574,7 +574,7 @@ EOF
     done
 }
 
-@test "stop_launch_services tries every root after one times out" {
+@test "stop_launch_services propagates an unload timeout after one scan" {
     mkdir -p "$HOME/Library/LaunchAgents"
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
@@ -596,7 +596,7 @@ EOF
         return 1
     }
     [[ "$output" == *"RC=124"* ]] || return 1
-    [[ "$(grep -c '^ROOT:' "$HOME/unload-roots.log" 2> /dev/null || true)" -eq 2 ]]
+    [[ "$(grep -c '^ROOT:' "$HOME/unload-roots.log" 2> /dev/null || true)" -eq 1 ]]
 }
 
 @test "batch uninstall names the app and step when a removal times out" {
@@ -1604,9 +1604,19 @@ EOF
     # the selected beta must still be unloaded under the guard (the bundle id
     # is demoted to "unknown", but the path scan is exact evidence), while the
     # one pointing at the survivor must stay loaded.
-    mkdir -p "$HOME/Library/LaunchAgents"
-    printf '%s' "$HOME/Applications/SharedName-beta.app/Contents/MacOS/SharedName" > "$HOME/Library/LaunchAgents/com.thirdparty.betahelper.plist"
-    printf '%s' "$HOME/Applications/SharedName.app/Contents/MacOS/SharedName" > "$HOME/Library/LaunchAgents/com.thirdparty.stablehelper.plist"
+    mkdir -p "$HOME/Library/LaunchAgents" \
+        "$HOME/Applications/SharedName-beta.app/Contents/MacOS" \
+        "$HOME/Applications/SharedName.app/Contents/MacOS"
+    touch "$HOME/Applications/SharedName-beta.app/Contents/MacOS/SharedName" \
+        "$HOME/Applications/SharedName.app/Contents/MacOS/SharedName"
+    cat > "$HOME/Library/LaunchAgents/com.thirdparty.betahelper.plist" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>$HOME/Applications/SharedName-beta.app/Contents/MacOS/SharedName</string></dict></plist>
+PLIST
+    cat > "$HOME/Library/LaunchAgents/com.thirdparty.stablehelper.plist" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>$HOME/Applications/SharedName.app/Contents/MacOS/SharedName</string></dict></plist>
+PLIST
+    mole_test_fake_command launchctl \
+        "if [[ \"\$1\" == unload ]]; then printf 'UNLOAD:%s\\n' \"\$2\" >> \"\$HOME/unload.log\"; fi"
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
@@ -1628,7 +1638,6 @@ pkill() { return 0; }
 sudo() { return 0; }
 remove_login_item() { printf 'LOGIN_ITEM:%s\n' "$1" >> "$HOME/login.log"; }
 force_kill_app() { printf 'KILL:%s\n' "$1" >> "$HOME/kill.log"; return 0; }
-unload_launch_plist() { printf 'UNLOAD:%s\n' "$1" >> "$HOME/unload.log"; }
 
 # Case 1: display names collide ("SharedName" for both) but basenames differ.
 # Discovery must use the basename (SharedName-beta) so the survivor's
@@ -1734,7 +1743,10 @@ grep -q "KILL:SoloApp" "$HOME/kill.log" 2> /dev/null || { echo "WRONG: terminati
 [[ ! -f "$HOME/Library/Logs/DiagnosticReports/SoloApp-2026-07-03-101010.ips" ]] || { echo "WRONG: diagnostic reports not collected without sibling guard (case 5)"; exit 1; }
 EOF
 
-    [ "$status" -eq 0 ]
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
 }
 
 @test "batch_uninstall_applications blocks official-uninstaller apps" {
@@ -1827,14 +1839,18 @@ EOF
 
 # Exercise the production removal/accounting phase with fixture-only sinks.
 run_leftover_accounting_case() {
-    local du_status="$1" expected_status="$2" expected_freed="$3"
+    local du_status="$1" expected_status="$2" expected_freed="$3" du_shape="${4:-total}"
     # shellcheck disable=SC2016 # Expanded by the PATH stub when du runs.
     mole_test_fake_command du '
 printf "%s\n" "$*" >> "$HOME/du.log"
-printf "40\t%s\n60\t%s\n100\ttotal\n" "$HOME/retained-one" "$HOME/retained-two"
+case "$DU_SHAPE" in
+    total) printf "40\t%s\n60\t%s\n100\ttotal\n" "$HOME/retained-one" "$HOME/retained-two" ;;
+    no-total) printf "40\t%s\n" "$HOME/retained-one" ;;
+    invalid-total) printf "unknown\ttotal\n" ;;
+esac
 exit "$DU_STATUS"'
-    run env HOME="$HOME/leftover-accounting-$du_status" PROJECT_ROOT="$PROJECT_ROOT" \
-        DU_STATUS="$du_status" EXPECTED_STATUS="$expected_status" EXPECTED_FREED="$expected_freed" \
+    run env HOME="$HOME/leftover-accounting-$du_status-$du_shape" PROJECT_ROOT="$PROJECT_ROOT" \
+        DU_STATUS="$du_status" DU_SHAPE="$du_shape" EXPECTED_STATUS="$expected_status" EXPECTED_FREED="$expected_freed" \
         /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
@@ -1891,6 +1907,21 @@ EOF
     run_leftover_accounting_case 0 0 60
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
     run_leftover_accounting_case 1 0 60
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "batch leftover accounting requires an actual total row" {
+    run_leftover_accounting_case 1 0 160 no-total
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "batch leftover accounting rejects a nonnumeric total" {
+    run_leftover_accounting_case 1 0 160 invalid-total
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "batch leftover accounting rejects an unexpected du error" {
+    run_leftover_accounting_case 2 0 160 total
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
 
@@ -2324,10 +2355,19 @@ EOF
 }
 
 @test "stop_launch_services unloads launch agents without deleting plists" {
-    mkdir -p "$HOME/Library/LaunchAgents"
-    touch "$HOME/Library/LaunchAgents/com.example.TestApp.plist"
-    touch "$HOME/Library/LaunchAgents/com.example.TestApp.helper.plist"
+    mkdir -p "$HOME/Library/LaunchAgents" \
+        "$HOME/Applications/TestApp.app/Contents/MacOS"
+    touch "$HOME/Applications/TestApp.app/Contents/MacOS/TestApp"
+    cat > "$HOME/Library/LaunchAgents/com.example.TestApp.plist" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><dict><key>Program</key><string>$HOME/Applications/TestApp.app/Contents/MacOS/TestApp</string></dict></plist>
+PLIST
     touch "$HOME/Library/LaunchAgents/com.example.TestApplication.plist"
+    cat > "$HOME/Library/LaunchAgents/com.example.TestApp.helper.plist" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><dict><key>ProgramArguments</key><array><string>$HOME/Applications/TestApp.app/Contents/MacOS/TestApp</string></array></dict></plist>
+PLIST
+    cat > "$HOME/Library/LaunchAgents/com.thirdparty.TestApp-other.plist" <<PLIST
+<?xml version="1.0"?><plist version="1.0"><!-- $HOME/Applications/TestApp.app --><dict><key>Program</key><string>/bin/true</string></dict></plist>
+PLIST
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
@@ -2351,15 +2391,19 @@ safe_sudo_remove() {
 	return 0
 }
 
-stop_launch_services "com.example.TestApp" "false" ""
+stop_launch_services "com.example.TestApp" "false" "$HOME/Applications/TestApp.app"
 
 	grep -Fq "launchctl unload $HOME/Library/LaunchAgents/com.example.TestApp.plist" "$trace"
 	grep -Fq "launchctl unload $HOME/Library/LaunchAgents/com.example.TestApp.helper.plist" "$trace"
+	[[ "$(grep -Fc "launchctl unload $HOME/Library/LaunchAgents/com.example.TestApp.plist" "$trace")" -eq 1 ]] || exit 1
+	[[ "$(grep -Fc "launchctl unload $HOME/Library/LaunchAgents/com.example.TestApp.helper.plist" "$trace")" -eq 1 ]] || exit 1
 	! grep -Fq "com.example.TestApplication.plist" "$trace" || exit 1
+	! grep -Fq "com.thirdparty.TestApp-other.plist" "$trace" || exit 1
 	! grep -q "safe_remove" "$trace" || exit 1
 	[[ -f "$HOME/Library/LaunchAgents/com.example.TestApp.plist" ]] || exit 1
 	[[ -f "$HOME/Library/LaunchAgents/com.example.TestApp.helper.plist" ]] || exit 1
 	[[ -f "$HOME/Library/LaunchAgents/com.example.TestApplication.plist" ]] || exit 1
+	[[ -f "$HOME/Library/LaunchAgents/com.thirdparty.TestApp-other.plist" ]] || exit 1
 EOF
 
     [ "$status" -eq 0 ]

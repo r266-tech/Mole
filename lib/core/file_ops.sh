@@ -702,6 +702,8 @@ _mole_complete_lsof_mode() {
     local records=""
     local probe_rc=0
     records=$(run_with_timeout "$probe_timeout" lsof -F pu -p 1 < /dev/null 2>&1) || probe_rc=$?
+    # A timed-out read proves nothing: retain this item, continue other cleanup.
+    mole_rc_timeout "$probe_rc" && return 2
     if mole_rc_timeout_or_signal "$probe_rc"; then
         return "$probe_rc"
     fi
@@ -724,6 +726,8 @@ _mole_complete_lsof_mode() {
     records=""
     probe_rc=0
     records=$(run_with_timeout "$probe_timeout" sudo -n lsof -F pu -p 1 < /dev/null 2>&1) || probe_rc=$?
+    # A timed-out read proves nothing: retain this item, continue other cleanup.
+    mole_rc_timeout "$probe_rc" && return 2
     if mole_rc_timeout_or_signal "$probe_rc"; then
         return "$probe_rc"
     fi
@@ -753,10 +757,6 @@ _mole_paths_have_open_handle() {
 
     local visibility_rc=0
     _mole_complete_lsof_mode || visibility_rc=$?
-    if mole_rc_timeout "$visibility_rc"; then
-        # An incomplete read-only probe is unknown, not a run cancellation.
-        return 2
-    fi
     if mole_rc_timeout_or_signal "$visibility_rc"; then
         return "$visibility_rc"
     fi
@@ -813,10 +813,6 @@ _mole_container_cache_has_open_handle() {
     fi
     local visibility_rc=0
     _mole_complete_lsof_mode "${_MOLE_CONTAINER_CACHE_PROBE_DEADLINE:-}" || visibility_rc=$?
-    if mole_rc_timeout "$visibility_rc"; then
-        # An incomplete read-only probe is unknown, not a run cancellation.
-        return 2
-    fi
     if mole_rc_timeout_or_signal "$visibility_rc"; then
         return "$visibility_rc"
     fi

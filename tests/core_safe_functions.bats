@@ -3604,3 +3604,33 @@ EOF
         done
     done
 }
+
+@test "read-only handle timeouts retain paths without cancelling cleanup (#1653)" {
+    local cache_dir="$HOME/Library/Group Containers/TEAM.com.example.shared/Library/Caches/Timeout"
+    mkdir -p "$cache_dir"
+    touch "$cache_dir/payload"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+lsof() { return 1; }
+run_with_timeout() { return "$PROBE_STATUS"; }
+for probe in _mole_paths_have_open_handle _mole_container_cache_has_open_handle; do
+    for visibility in direct unknown; do
+        for PROBE_STATUS in 124 130 143; do
+            if [[ "$visibility" == direct ]]; then
+                _MOLE_COMPLETE_LSOF_MODE=direct
+            else
+                unset _MOLE_COMPLETE_LSOF_MODE
+            fi
+            rc=0
+            "$probe" "$cache_dir" || rc=$?
+            printf '%s:%s:%s=%s\n' "$probe" "$visibility" "$PROBE_STATUS" "$rc"
+            [[ "$PROBE_STATUS" != 124 || "$rc" == 2 ]] || exit 1
+            [[ "$PROBE_STATUS" == 124 || "$rc" == "$PROBE_STATUS" ]] || exit 1
+        done
+    done
+done
+EOF
+    [ "$status" -eq 0 ] || return 1
+    [[ -e "$cache_dir/payload" ]] || return 1
+}

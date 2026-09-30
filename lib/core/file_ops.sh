@@ -631,16 +631,7 @@ _mole_sqlite_database_in_use() {
     # empty array is an unbound-variable error under set -u.
     [[ ${#family[@]} -gt 0 ]] || return 1
 
-    local handle_rc=0
-    _mole_paths_have_open_handle "${family[@]}" || handle_rc=$?
-    if mole_rc_timeout "$handle_rc"; then
-        # A read-only handle probe that timed out proves neither idle nor live.
-        # Keep this family without cancelling unrelated cleanup (#1595).
-        # Signals and deletion timeouts retain their cancellation semantics.
-        debug_log "SQLite handle probe timed out, keeping database: $path"
-        return 2
-    fi
-    return "$handle_rc"
+    _mole_paths_have_open_handle "${family[@]}"
 }
 
 _mole_user_cache_sqlite_has_open_handle() {
@@ -762,6 +753,10 @@ _mole_paths_have_open_handle() {
 
     local visibility_rc=0
     _mole_complete_lsof_mode || visibility_rc=$?
+    if mole_rc_timeout "$visibility_rc"; then
+        # An incomplete read-only probe is unknown, not a run cancellation.
+        return 2
+    fi
     if mole_rc_timeout_or_signal "$visibility_rc"; then
         return "$visibility_rc"
     fi
@@ -778,6 +773,10 @@ _mole_paths_have_open_handle() {
     # flag meant to explain the run was quietly changing it.
     open_records=$(MO_DEBUG=0 _mole_run_complete_lsof "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
         -F n -- "$@" 2>&1) || lsof_rc=$?
+    if mole_rc_timeout "$lsof_rc"; then
+        # An incomplete read-only probe is unknown, not a run cancellation.
+        return 2
+    fi
     if mole_rc_timeout_or_signal "$lsof_rc"; then
         return "$lsof_rc"
     fi
@@ -814,6 +813,10 @@ _mole_container_cache_has_open_handle() {
     fi
     local visibility_rc=0
     _mole_complete_lsof_mode "${_MOLE_CONTAINER_CACHE_PROBE_DEADLINE:-}" || visibility_rc=$?
+    if mole_rc_timeout "$visibility_rc"; then
+        # An incomplete read-only probe is unknown, not a run cancellation.
+        return 2
+    fi
     if mole_rc_timeout_or_signal "$visibility_rc"; then
         return "$visibility_rc"
     fi
@@ -842,6 +845,10 @@ _mole_container_cache_has_open_handle() {
             -F pfn -- "$path" 2>&1) || lsof_rc=$?
     fi
 
+    if mole_rc_timeout "$lsof_rc"; then
+        # An incomplete read-only probe is unknown, not a run cancellation.
+        return 2
+    fi
     if mole_rc_timeout_or_signal "$lsof_rc"; then
         return "$lsof_rc"
     fi

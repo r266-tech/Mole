@@ -3393,3 +3393,187 @@ EOF_INNER
     [[ "$output" == *"Could not inspect ~/www/test-project/node_modules; kept"* ]] || return 1
     [[ "$output" == *"OUTCOME=incomplete"* ]] || return 1
 }
+
+
+@test "activity batch inspects later fast artifacts without selecting recent or failed probes" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_ACTIVITY'
+set -euo pipefail
+rm -f "$HOME/fast-probed"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+for name in a-slow b-fast c-recent d-error; do
+    artifact="$HOME/www/$name/node_modules"
+    mkdir -p "$artifact"
+    touch "$HOME/www/$name/package.json"
+    touch -t 202001010101 "$artifact"
+done
+touch "$HOME/www/c-recent/node_modules/current.js"
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() {
+    printf '%s\n' "$HOME/www/"{a-slow,b-fast,c-recent,d-error}/node_modules > "$2"
+}
+purge_artifact_has_authored_content() { return 1; }
+get_optimal_parallel_jobs() { echo 4; }
+get_dir_size_kb() { echo 1; }
+safe_remove() { printf 'SELECTED:%s\n' "$1"; }
+mkdir -p "$HOME/activity-bin"
+cat > "$HOME/activity-bin/find" <<'EOF_FIND'
+#!/bin/bash
+case "$1" in
+    */a-slow/node_modules)
+        while [[ ! -e "$HOME/fast-probed" ]]; do sleep 0.05; done
+        ;;
+    */b-fast/node_modules) touch "$HOME/fast-probed" ;;
+    */d-error/node_modules) exit 2 ;;
+    *) exec /usr/bin/find "$@" ;;
+esac
+EOF_FIND
+chmod +x "$HOME/activity-bin/find"
+export PATH="$HOME/activity-bin:$PATH"
+export MO_PURGE_ACTIVITY_TOTAL_TIMEOUT_SEC=5 MO_PURGE_ACTIVITY_TIMEOUT_SEC=5
+export MOLE_DRY_RUN=1
+clean_project_artifacts </dev/null
+[[ -e "$HOME/fast-probed" ]] || exit 1
+for name in a-slow b-fast c-recent d-error; do
+    [[ -d "$HOME/www/$name/node_modules" ]] || exit 1
+done
+EOF_ACTIVITY
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"SELECTED:$HOME/www/b-fast/node_modules"* ]] || return 1
+    [[ "$output" == *"SELECTED:$HOME/www/a-slow/node_modules"* ]] || return 1
+    [[ "$output" != *"SELECTED:$HOME/www/c-recent/node_modules"* ]] || return 1
+    [[ "$output" != *"SELECTED:$HOME/www/d-error/node_modules"* ]] || return 1
+}
+
+@test "activity batch propagates worker cancellation, drains peers, and removes result files" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_CANCEL'
+set -euo pipefail
+rm -f "$HOME/peer-retired" "$HOME/registered-results"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+for name in a-cancel b-peer c-later; do
+    artifact="$HOME/www/$name/node_modules"
+    mkdir -p "$artifact"
+    touch "$HOME/www/$name/package.json"
+done
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() { printf '%s\n' "$HOME/www/"{a-cancel,b-peer,c-later}/node_modules > "$2"; }
+purge_artifact_has_authored_content() { return 1; }
+get_optimal_parallel_jobs() { echo 2; }
+get_dir_size_kb() { echo SIZE_PHASE_REACHED >&2; echo 1; }
+safe_remove() { echo UNEXPECTED_REMOVE; }
+is_recently_modified() {
+    case "$1" in
+        */a-cancel/node_modules) return 143 ;;
+        */b-peer/node_modules) sleep 0.2; touch "$HOME/peer-retired"; return 1 ;;
+        *) echo LATER_PROBE_REACHED >&2; return 1 ;;
+    esac
+}
+register_temp_file() { printf '%s\n' "$1" >> "$HOME/registered-results"; }
+export MOLE_DRY_RUN=1
+result=0
+clean_project_artifacts </dev/null || result=$?
+printf 'RESULT=%s OUTCOME=%s\n' "$result" "$PURGE_RUN_OUTCOME"
+[[ -e "$HOME/peer-retired" ]] || exit 1
+while IFS= read -r result_file; do [[ ! -e "$result_file" ]] || exit 1; done < "$HOME/registered-results"
+[[ "$result" -eq 143 && "$PURGE_RUN_OUTCOME" == cancelled ]] || exit 1
+EOF_CANCEL
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RESULT=143 OUTCOME=cancelled"* ]] || return 1
+    [[ "$output" != *"SIZE_PHASE_REACHED"* ]] || return 1
+    [[ "$output" != *"LATER_PROBE_REACHED"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
+}
+
+
+@test "activity batch handles parent TERM before later probes and restores caller trap" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_TERM'
+set -euo pipefail
+rm -f "$HOME/activity-started" "$HOME/activity-peer-done"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+for name in a-first b-peer c-later; do
+    mkdir -p "$HOME/www/$name/node_modules"
+    touch "$HOME/www/$name/package.json"
+done
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() { printf '%s\n' "$HOME/www/"{a-first,b-peer,c-later}/node_modules > "$2"; }
+purge_artifact_has_authored_content() { return 1; }
+get_optimal_parallel_jobs() { echo 2; }
+get_dir_size_kb() { echo SIZE_PHASE_REACHED >&2; echo 1; }
+is_recently_modified() {
+    [[ "$1" != *c-later* ]] || { echo LATER_PROBE_REACHED >&2; return 1; }
+    touch "$HOME/activity-started"
+    sleep 0.4
+    touch "$HOME/activity-peer-done"
+    return 1
+}
+trap 'echo CALLER_TERM' TERM
+caller_trap=$(trap -p TERM)
+(
+    while [[ ! -e "$HOME/activity-started" ]]; do sleep 0.05; done
+    kill -TERM "$$"
+) & sender=$!
+export MOLE_DRY_RUN=1
+result=0
+clean_project_artifacts </dev/null || result=$?
+wait "$sender"
+printf 'RESULT=%s OUTCOME=%s\n' "$result" "$PURGE_RUN_OUTCOME"
+[[ -e "$HOME/activity-peer-done" ]] || exit 1
+[[ "$(trap -p TERM)" == "$caller_trap" ]] || exit 1
+[[ "$result" -eq 143 && "$PURGE_RUN_OUTCOME" == cancelled ]] || exit 1
+EOF_TERM
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RESULT=143 OUTCOME=cancelled"* ]] || return 1
+    [[ "$output" != *"SIZE_PHASE_REACHED"* ]] || return 1
+    [[ "$output" != *"LATER_PROBE_REACHED"* ]] || return 1
+    [[ "$output" != *"CALLER_TERM"* ]] || return 1
+}
+
+@test "activity batch drains the first worker across repeated parent TERM signals" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF_REPEAT_TERM'
+set -euo pipefail
+rm -f "$HOME/activity-started" "$HOME/activity-peer-done" "$HOME/activity-first-done"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+for name in a-first b-peer c-later; do
+    mkdir -p "$HOME/www/$name/node_modules"
+    touch "$HOME/www/$name/package.json"
+done
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() { printf '%s\n' "$HOME/www/"{a-first,b-peer,c-later}/node_modules > "$2"; }
+purge_artifact_has_authored_content() { return 1; }
+get_optimal_parallel_jobs() { echo 2; }
+get_dir_size_kb() { echo SIZE_PHASE_REACHED >&2; echo 1; }
+is_recently_modified() {
+    [[ "$1" != *c-later* ]] || { echo LATER_PROBE_REACHED >&2; return 1; }
+    touch "$HOME/activity-started"
+    if [[ "$1" == *a-first* ]]; then
+        sleep 1
+        touch "$HOME/activity-first-done"
+    else
+        sleep 0.4
+    fi
+    touch "$HOME/activity-peer-done"
+    return 1
+}
+trap 'echo CALLER_TERM' TERM
+caller_trap=$(trap -p TERM)
+(
+    while [[ ! -e "$HOME/activity-started" ]]; do sleep 0.05; done
+    kill -TERM "$$"
+    sleep 0.1
+    kill -TERM "$$"
+) & sender=$!
+export MOLE_DRY_RUN=1
+result=0
+clean_project_artifacts </dev/null || result=$?
+wait "$sender"
+printf 'RESULT=%s OUTCOME=%s\n' "$result" "$PURGE_RUN_OUTCOME"
+[[ -e "$HOME/activity-peer-done" ]] || exit 1
+[[ -e "$HOME/activity-first-done" ]] || { echo FIRST_WORKER_NOT_DRAINED; exit 1; }
+[[ "$(trap -p TERM)" == "$caller_trap" ]] || exit 1
+[[ "$result" -eq 143 && "$PURGE_RUN_OUTCOME" == cancelled ]] || exit 1
+EOF_REPEAT_TERM
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RESULT=143 OUTCOME=cancelled"* ]] || return 1
+    [[ "$output" != *"SIZE_PHASE_REACHED"* ]] || return 1
+    [[ "$output" != *"LATER_PROBE_REACHED"* ]] || return 1
+    [[ "$output" != *"CALLER_TERM"* ]] || return 1
+}

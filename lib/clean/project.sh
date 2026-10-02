@@ -2083,22 +2083,75 @@ clean_project_artifacts() {
         _activity_total_timeout="$MOLE_TIMEOUT_HINT_SCAN_SEC"
     fi
     local _PURGE_ACTIVITY_DEADLINE_EPOCH=$((_now_epoch + _activity_total_timeout))
+    # A few slow artifacts must not consume every later artifact's opportunity.
+    # Reuse the discovery concurrency ceiling, while keeping the SAME shared
+    # deadline and per-item classifier. Results stay indexed until all workers
+    # finish; only a complete, successful old classification can preselect a row.
+    local -a _activity_pids=() _activity_tmpfiles=()
+    local _activity_interrupt_status=0
+    local _activity_previous_int_trap _activity_previous_term_trap
+    _activity_previous_int_trap=$(trap -p INT || true)
+    _activity_previous_term_trap=$(trap -p TERM || true)
+    trap '[[ $_activity_interrupt_status -ge 128 ]] || _activity_interrupt_status=130' INT
+    trap '[[ $_activity_interrupt_status -ge 128 ]] || _activity_interrupt_status=143' TERM
+    _wait_purge_activity_batch() {
+        local activity_pid worker_status
+        for activity_pid in "${_activity_pids[@]+"${_activity_pids[@]}"}"; do
+            worker_status=0
+            wait "$activity_pid" 2> /dev/null || worker_status=$?
+            if [[ $worker_status -ge 128 ]]; then
+                [[ $_activity_interrupt_status -ge 128 ]] || _activity_interrupt_status=$worker_status
+                # A signal can interrupt wait while its worker is still alive.
+                # Drain bounded read-only probes before returning; killing just
+                # their shell would leave timeout helpers or find children behind.
+                while kill -0 "$activity_pid" 2> /dev/null; do
+                    wait "$activity_pid" 2> /dev/null || true
+                done
+            fi
+        done
+        _activity_pids=()
+    }
     for item in "${safe_to_clean[@]}"; do
-        local is_recent=true
-        local activity_status=0
-        _PURGE_ACTIVITY_STATE="uncertain"
-        is_recently_modified "$item" "$_now_epoch" || activity_status=$?
-        if [[ $activity_status -ge 128 ]]; then
-            PURGE_RUN_OUTCOME="cancelled"
-            [[ ! -t 1 ]] || stop_inline_spinner
-            return "$activity_status"
+        [[ $_activity_interrupt_status -ge 128 ]] && break
+        local activity_temp
+        activity_temp=$(mktemp)
+        register_temp_file "$activity_temp"
+        _activity_tmpfiles+=("$activity_temp")
+        (
+            _PURGE_ACTIVITY_STATE="uncertain"
+            activity_status=0
+            is_recently_modified "$item" "$_now_epoch" || activity_status=$?
+            printf '%s %s\n' "$activity_status" "${_PURGE_ACTIVITY_STATE:-uncertain}" > "$activity_temp"
+            [[ $activity_status -lt 128 ]] || exit "$activity_status"
+        ) < /dev/null &
+        _activity_pids+=("$!")
+        if [[ ${#_activity_pids[@]} -ge $max_scan_jobs ]]; then
+            _wait_purge_activity_batch
         fi
-        # A bounded menu probe may time out: retain that row, unchecked.
-        local activity_state="${_PURGE_ACTIVITY_STATE:-uncertain}"
-        if [[ $activity_status -eq 1 ]]; then
+    done
+    _wait_purge_activity_batch
+    trap - INT TERM
+    # eval: restore the caller traps captured before starting activity workers.
+    [[ -z "$_activity_previous_int_trap" ]] || eval "$_activity_previous_int_trap"
+    [[ -z "$_activity_previous_term_trap" ]] || eval "$_activity_previous_term_trap"
+    if [[ $_activity_interrupt_status -ge 128 ]]; then
+        for activity_temp in "${_activity_tmpfiles[@]+"${_activity_tmpfiles[@]}"}"; do
+            rm -f "$activity_temp"
+        done
+        PURGE_RUN_OUTCOME="cancelled"
+        [[ ! -t 1 ]] || stop_inline_spinner
+        return "$_activity_interrupt_status"
+    fi
+    for activity_temp in "${_activity_tmpfiles[@]}"; do
+        local is_recent=true activity_status=0 activity_state="uncertain"
+        if ! read -r activity_status activity_state < "$activity_temp"; then
+            activity_state="uncertain"
+        fi
+        rm -f "$activity_temp"
+        if [[ "$activity_status" == "1" ]]; then
             is_recent=false
             activity_state="old"
-        elif [[ "$activity_state" != "recent" ]]; then
+        elif [[ "$activity_status" != "0" || "$activity_state" != "recent" ]]; then
             activity_state="uncertain"
         fi
         safe_recent_flags+=("$is_recent")

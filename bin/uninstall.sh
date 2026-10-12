@@ -692,6 +692,8 @@ uninstall_print_app_paths_with_mtime() {
             for app_path in "$@"; do
                 if [[ -e "$app_path/Contents/Info.plist" || -L "$app_path/Contents/Info.plist" ]]; then
                     stat_paths+=("$app_path/Contents/Info.plist")
+                elif [[ -e "$app_path/Info.plist" || -L "$app_path/Info.plist" ]]; then
+                    stat_paths+=("$app_path/Info.plist")
                 fi
             done
         fi
@@ -707,6 +709,7 @@ uninstall_print_app_paths_with_mtime() {
                         for (i = 1; i <= count; i++) {
                             path = paths[i]
                             info = mtimes[path "/Contents/Info.plist"]
+                            if (info == "") info = mtimes[path "/Info.plist"]
                             printf "%s\t%s\t%s\n", mtimes[path], (info == "" ? 0 : info), path
                         }
                     }
@@ -722,7 +725,11 @@ uninstall_print_app_paths_with_mtime() {
                 app_mtime=$("$stat_cmd" -f%m "$app_path" 2>/dev/null) || app_mtime=0
                 [[ "$app_mtime" =~ ^[0-9]+$ ]] || app_mtime=0
                 if [[ "$include_info" == true ]]; then
-                    info_mtime=$("$stat_cmd" -f%m "$app_path/Contents/Info.plist" 2>/dev/null) || info_mtime=0
+                    info_path="$app_path/Contents/Info.plist"
+                    if [[ ! -e "$info_path" && ! -L "$info_path" ]]; then
+                        info_path="$app_path/Info.plist"
+                    fi
+                    info_mtime=$("$stat_cmd" -f%m "$info_path" 2>/dev/null) || info_mtime=0
                     [[ "$info_mtime" =~ ^[0-9]+$ ]] || info_mtime=0
                     printf "%s\t%s\t%s\n" "$app_mtime" "$info_mtime" "$app_path"
                 else

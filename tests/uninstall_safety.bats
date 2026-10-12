@@ -1386,3 +1386,46 @@ printf 'NATIVE_SIBLING_RC=%s\n' "$rc"
 EOF
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
+
+@test "PlayCover inventory reads flat bundle metadata and invalidates its cache (#1715)" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/uninstall.sh"
+root="$HOME/Library/Containers/io.playcover.PlayCover/Applications"
+app="$root/com.example.Game.app"
+mkdir -p "$app"
+cat > "$app/Info.plist" <<'PLIST'
+<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.example.Game</string><key>CFBundleDisplayName</key><string>Example Game</string></dict></plist>
+PLIST
+uninstall_print_app_search_dirs | grep -Fx "$root" > /dev/null || exit 1
+[[ "$(uninstall_resolve_bundle_id "$app")" == com.example.Game ]] || exit 1
+mdls() { return 1; }
+[[ "$(uninstall_resolve_display_name "$app" com.example.Game)" == 'Example Game' ]] || exit 1
+touch -t 202501010101 "$app/Info.plist"
+before=$(uninstall_print_app_paths_with_mtime "$root" true)
+IFS=$'\t' read -r app_mtime info_mtime app_path <<< "$before"
+[[ "$app_path" == "$app" && "$info_mtime" == "$(stat -f%m "$app/Info.plist")" ]] || exit 1
+touch -t 202501010102 "$app/Info.plist"
+after=$(uninstall_print_app_paths_with_mtime "$root" true)
+[[ "$before" != "$after" ]] || exit 1
+uninstall_print_app_search_dirs() { printf '%s\n' "$root"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+before=$(uninstall_app_inventory_fingerprint)
+touch -t 202501010103 "$app/Info.plist"
+after=$(uninstall_app_inventory_fingerprint)
+! uninstall_inventory_can_reuse_cached_apps "$before" "$after" || exit 1
+
+cat > "$HOME/stat-fallback" <<'STAT'
+#!/bin/bash
+if [[ "$1" == -f ]]; then
+    printf 'partial batch output\n'
+    exit 1
+fi
+exec /usr/bin/stat "$@"
+STAT
+chmod +x "$HOME/stat-fallback"
+STAT_BSD="$HOME/stat-fallback"
+[[ "$(uninstall_print_app_paths_with_mtime "$root" true)" == "$(/usr/bin/stat -f '%m' "$app")"$'\t'"$(/usr/bin/stat -f '%m' "$app/Info.plist")"$'\t'"$app" ]] || exit 1
+EOF
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}

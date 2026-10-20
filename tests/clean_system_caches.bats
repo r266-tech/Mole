@@ -1548,6 +1548,60 @@ EOF
 	[[ "$output" == "PARENT_RC=143 WORKER_SURVIVED=no" ]] || return 1
 }
 
+@test "clean_project_caches reaps a worker interrupted before PID registration" {
+	local scan_home="$HOME/interrupted-scan-registration"
+	mkdir -p "$scan_home/root"
+	mkfifo "$scan_home/worker-gate" "$scan_home/worker-ready"
+
+	run env HOME="$scan_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+exec 3<> "$HOME/worker-gate"
+exec 4<> "$HOME/worker-ready"
+discover_project_cache_roots() { printf '%s\n' "$HOME/root"; }
+get_optimal_parallel_jobs() { printf '1\n'; }
+armed=false
+previous_pid=""
+project_cache_root_is_walkable() {
+	previous_pid="${!:-}"
+	armed=true
+	return 0
+}
+scan_project_cache_root() {
+	: > "$2"
+	trap 'exit 143' TERM
+	printf 'ready\n' >&4
+	# A watchdog bounds the broken path; cancellation should interrupt this read immediately.
+	IFS= read -r -t 10 -u 3 release || true
+	touch "$HOME/worker-survived"
+}
+process_project_cache_matches() { :; }
+interrupt_new_worker() {
+	# DEBUG observes the new $! before the parent's next command can register it.
+	# Subshells inherit the trap but must not signal the owning shell themselves.
+	if [[ $BASH_SUBSHELL -eq 0 && $armed == true && -n "${!:-}" && "${!:-}" != "$previous_pid" ]]; then
+		armed=false
+		IFS= read -r -t 10 -u 4 ready || exit 1
+		touch "$HOME/window-hit"
+		kill -TERM "$$"
+	fi
+	return 0
+}
+set -T
+trap interrupt_new_worker DEBUG
+clean_rc=0
+clean_project_caches || clean_rc=$?
+trap - DEBUG
+printf 'RC=%s WINDOW=%s SURVIVED=%s\n' "$clean_rc" \
+	"$([[ -e "$HOME/window-hit" ]] && printf yes || printf no)" \
+	"$([[ -e "$HOME/worker-survived" ]] && printf yes || printf no)"
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == "RC=143 WINDOW=yes SURVIVED=no" ]] || return 1
+}
+
 @test "scan_project_cache_root discards partial output when its producer times out" {
 	mkdir -p "$HOME/Projects/app/.next/cache"
 	touch "$HOME/Projects/app/package.json"

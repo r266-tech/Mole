@@ -1112,6 +1112,11 @@ clean_project_caches() {
         scan_project_cache_root "$root" "$root_matches_file" < /dev/null &
         local scan_root_index=$((${#root_matches_files[@]} - 1))
         scan_pids[scan_root_index]="$!"
+        # A signal can arrive after launch but before the PID is registered.
+        if [[ $scan_interrupt_status -ge 128 ]]; then
+            _cleanup_project_cache_scan_workers
+            break
+        fi
         if [[ ${#scan_pids[@]} -ge $max_scan_jobs ]]; then
             _wait_for_project_cache_scan_batch false || scan_interrupt_status=$?
             if [[ $scan_interrupt_status -ge 128 ]]; then

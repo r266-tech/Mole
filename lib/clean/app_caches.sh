@@ -1714,11 +1714,6 @@ clean_futu_update_downloads() {
         mole_report_guard_stop "Futu update downloads" mole_defer_cleanup_family "Futu"
         return 0
     fi
-    if ! declare -f safe_clean_guarded > /dev/null 2>&1; then
-        safe_clean "$root"/* "Futu update downloads"
-        return $?
-    fi
-
     local guarded_rc=0
     safe_clean_guarded _futu_update_delete_guard_allows "$root"/* "Futu update downloads" || guarded_rc=$?
     if [[ $guarded_rc -eq 75 ]]; then

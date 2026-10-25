@@ -212,6 +212,10 @@ declare -a SAFETY_WHITELIST_PATTERNS=(
     "$HOME/Library/Caches/com.apple.spotlight*"
     "$HOME/Library/Caches/com.apple.Spotlight*"
     "$HOME/Library/Caches/CloudKit*"
+    # Kitty keeps a live graphics-protocol cache here; removing it from a
+    # running session makes subsequent image transfers fail until the
+    # directory is recreated.
+    "$HOME/Library/Caches/kitty"
     "$HOME/Library/Caches/pypoetry/virtualenvs*"
     "$HOME/Library/Caches/org.R-project.R/R/renv/*"
 )

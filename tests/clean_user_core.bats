@@ -685,7 +685,7 @@ EOF
     done
 }
 
-@test "a custom whitelist still protects system caches, Poetry virtualenvs and the renv cache" {
+@test "a custom whitelist still protects system caches, Kitty, Poetry virtualenvs and the renv cache" {
     # clean_user_essentials sweeps every child of ~/Library/Caches, and
     # load_mole_whitelist replaces DEFAULT_WHITELIST_PATTERNS wholesale once a
     # user saves one entry of their own. Anything that breaks macOS search,
@@ -696,6 +696,7 @@ EOF
         "$test_home/Library/Caches/com.apple.spotlight" \
         "$test_home/Library/Caches/com.apple.FontRegistry" \
         "$test_home/Library/Caches/CloudKit" \
+        "$test_home/Library/Caches/kitty/graphics-cache" \
         "$test_home/Library/Caches/pypoetry/virtualenvs/proj-abc123" \
         "$test_home/Library/Caches/org.R-project.R/R/renv/cache/v5/pkg" \
         "$test_home/Library/Caches/com.example.unprotected"
@@ -710,6 +711,8 @@ for probe in \
     "$HOME/Library/Caches/com.apple.spotlight" \
     "$HOME/Library/Caches/com.apple.FontRegistry" \
     "$HOME/Library/Caches/CloudKit" \
+    "$HOME/Library/Caches/kitty" \
+    "$HOME/Library/Caches/kitty/graphics-cache" \
     "$HOME/Library/Caches/pypoetry/virtualenvs/proj-abc123" \
     "$HOME/Library/Caches/org.R-project.R/R/renv/cache/v5/pkg" \
     "$HOME/Library/Caches/org.R-project.R" \
@@ -736,6 +739,8 @@ EOF
         return 1
     }
     [[ "$output" == *"PROTECTED=Library/Caches/com.apple.spotlight"* ]] || return 1
+    [[ "$output" == *"PROTECTED=Library/Caches/kitty"* ]] || return 1
+    [[ "$output" == *"PROTECTED=Library/Caches/kitty/graphics-cache"* ]] || return 1
     [[ "$output" == *"PROTECTED=Library/Caches/pypoetry/virtualenvs/proj-abc123"* ]] || return 1
     [[ "$output" == *"PROTECTED=Library/Caches/org.R-project.R/R/renv/cache/v5/pkg"* ]] || return 1
     # The sweep removes top-level children of ~/Library/Caches, so the parent

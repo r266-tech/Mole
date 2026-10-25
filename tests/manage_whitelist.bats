@@ -536,13 +536,15 @@ EOF
     [ "$status" -eq 0 ]
 }
 
-@test "default whitelist protects tealdeer cache parent for tldr pages" {
+@test "default whitelist protects tealdeer and Kitty cache paths" {
     local status
     if HOME="$HOME" /bin/bash --noprofile --norc -c "
         source '$PROJECT_ROOT/lib/manage/whitelist.sh'
         rm -f \"\$HOME/.config/mole/whitelist\"
         load_whitelist
-        is_path_whitelisted \"\$HOME/Library/Caches/tealdeer\"
+        is_path_whitelisted \"\$HOME/Library/Caches/tealdeer\" &&
+            is_path_whitelisted \"\$HOME/Library/Caches/kitty\" &&
+            is_path_whitelisted \"\$HOME/Library/Caches/kitty/graphics-cache\"
     "; then
         status=0
     else

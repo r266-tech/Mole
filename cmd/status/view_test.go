@@ -737,6 +737,22 @@ func TestFormatDiskLine(t *testing.T) {
 			wantFree:     "0 free",
 			wantNoSubstr: "%",
 		},
+		{
+			name:         "purgeable space is excluded from immediate free space",
+			label:        "INTR",
+			disk:         DiskStatus{UsedPercent: 64.9, Used: 1226 << 30, Total: 1860 << 30, Purgeable: 141 << 30},
+			wantUsed:     "1T used",
+			wantFree:     "493G free",
+			wantNoSubstr: "%",
+		},
+		{
+			name:         "purgeable exceeds available space clamps free to zero",
+			label:        "INTR",
+			disk:         DiskStatus{UsedPercent: 90, Used: 90 << 30, Total: 100 << 30, Purgeable: 20 << 30},
+			wantUsed:     "90G used",
+			wantFree:     "0 free",
+			wantNoSubstr: "%",
+		},
 	}
 
 	for _, tt := range tests {

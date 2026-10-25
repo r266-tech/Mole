@@ -544,6 +544,14 @@ func formatDiskLine(label string, d DiskStatus) string {
 	if d.Total > d.Used {
 		free = d.Total - d.Used
 	}
+	// Finder's corrected used value includes purgeable APFS space in the
+	// corresponding free value. Keep the main status line for immediately
+	// free space; the meta line below reports purgeable space separately.
+	if free > d.Purgeable {
+		free -= d.Purgeable
+	} else {
+		free = 0
+	}
 	return fmt.Sprintf("%-6s %s  %s used, %s free", label, bar, used, humanBytesShort(free))
 }
 

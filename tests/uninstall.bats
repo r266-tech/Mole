@@ -5941,6 +5941,11 @@ EOF
     }
 }
 
+@test "Homebrew output does not interleave with the uninstall spinner" {
+    run python3 "$PROJECT_ROOT/tests/uninstall_brew_output_pty.py"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
 @test "match_apps_by_name joins multi-word args into one exact app name (#1365)" {
     # `mo uninstall Tor Browser` arrives as two words; "Tor" alone
     # substring-matched WebSTORm. The joined words exactly name an

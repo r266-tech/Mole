@@ -2732,6 +2732,13 @@ _batch_execute_removals() {
         fi
         if [[ -z "$reason" ]]; then
             if [[ "$is_brew_cask" == "true" && -n "$cask_name" ]]; then
+                # Homebrew and sudo write directly to the terminal. Stop the
+                # spinner before they do so neither can overwrite the other.
+                if [[ -t 1 ]]; then
+                    stop_inline_spinner
+                    [[ -t 2 ]] && printf '\r\033[2K' >&2
+                    printf '%s\n' "${_phase_prefix}Removing $(_uninstall_display_text "$app_name") (${_phase_size})..." >&2
+                fi
                 # Mole removes only the reviewed paths below. A cask zap can
                 # reach data that was not selected or even discovered.
                 # Use brew_uninstall_cask helper (handles env vars, timeout, verification)

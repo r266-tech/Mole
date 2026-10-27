@@ -677,7 +677,7 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"npm cache directory|$HOME/.npm/_cacache/*"* ]] || return 1
-    [[ "$output" == *"npm npx cache|$HOME/.npm/_npx/*"* ]] || return 1
+    [[ "$output" != *"$HOME/.npm/_npx/"* ]] || return 1
     [[ "$output" == *"npm logs|$HOME/.npm/_logs/*"* ]] || return 1
     [[ "$output" == *"npm prebuilds|$HOME/.npm/_prebuilds/*"* ]]
 }
@@ -1100,9 +1100,50 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"npm cache directory|$HOME/.npm/_cacache/*"* ]] || return 1
     [[ "$output" == *"npm cache directory (custom path)|/tmp/mole-custom-npm-cache/_cacache/*"* ]] || return 1
-    [[ "$output" == *"npm npx cache (custom path)|/tmp/mole-custom-npm-cache/_npx/*"* ]] || return 1
+    [[ "$output" != *"/_npx/"* ]] || return 1
     [[ "$output" == *"npm logs (custom path)|/tmp/mole-custom-npm-cache/_logs/*"* ]] || return 1
     [[ "$output" == *"npm prebuilds (custom path)|/tmp/mole-custom-npm-cache/_prebuilds/*"* ]]
+}
+
+@test "clean_dev_npm preserves installed npx packages in default and custom caches (#1870)" {
+    run env HOME="$BATS_TEST_TMPDIR/home" PROJECT_ROOT="$PROJECT_ROOT" PATH="/usr/bin:/bin" \
+        MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+mkdir -p "$HOME"
+source "$PROJECT_ROOT/bin/clean.sh"
+clean_pnpm_stores() { :; }
+clean_corepack_cache() { :; }
+bun() { return 1; }
+run_with_timeout() { shift; "$@"; }
+npm() {
+    case "$*" in
+        'config get cache') printf '%s\n' "$npm_test_cache" ;;
+        'cache clean --force') return 0 ;;
+        *) return 1 ;;
+    esac
+}
+for npm_test_cache in "$HOME/.npm" "$HOME/custom-npm-cache"; do
+    for DRY_RUN in true false; do
+        export DRY_RUN
+        for cache in "$HOME/.npm" "$npm_test_cache"; do
+            mkdir -p "$cache/_npx/fixture/node_modules/fixture" "$cache/_cacache/fixture"
+            printf 'RESOURCE_OK' > "$cache/_npx/fixture/node_modules/fixture/resource.txt"
+            printf 'CACHE' > "$cache/_cacache/fixture/data"
+        done
+        clean_dev_npm
+        for cache in "$HOME/.npm" "$npm_test_cache"; do
+            [[ "$(cat "$cache/_npx/fixture/node_modules/fixture/resource.txt")" == RESOURCE_OK ]] || exit 1
+            if [[ "$DRY_RUN" == false ]]; then
+                [[ ! -e "$cache/_cacache/fixture" ]] || exit 1
+            else
+                [[ -f "$cache/_cacache/fixture/data" ]] || exit 1
+            fi
+        done
+    done
+done
+EOF
+
+    [ "$status" -eq 0 ]
 }
 
 @test "clean_dev_npm falls back to default cache when npm path is invalid" {

@@ -1608,7 +1608,7 @@ clean_dev_docker
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Docker unused data · review with docker system df"* ]] || return 1
+    [[ "$output" == *"Docker unused data · review with docker system df -v"* ]] || return 1
     [[ "$output" == *"Docker BuildX cache"* ]] || return 1
     [[ "$output" != *"docker called"* ]]
 }
@@ -1649,7 +1649,7 @@ clean_dev_docker
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"OrbStack container data · 4M · review with docker system df"* ]] || return 1
+    [[ "$output" == *"OrbStack container data · 4M · review with docker system df -v"* ]] || return 1
     [[ "$output" == *"Docker BuildX cache|$HOME/.docker/buildx/cache/*"* ]] || return 1
     [[ "$output" != *"data.img.raw"* ]] || return 1
     [[ "$output" != *"swap.img"* ]]
@@ -1682,7 +1682,7 @@ printf 'SIGNAL RC=%s CANCEL=%s\n' "$rc" "$MOLE_CLEAN_CANCEL_STATUS"
 EOF
 
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
-    [[ "$output" == *"OrbStack container data · review with docker system df"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"OrbStack container data · review with docker system df -v"* ]] || { echo "$output"; return 1; }
     [[ "$output" == *"BUILDX:Docker BuildX cache"*"TIMEOUT RC=0 CANCEL=0"* ]] || { echo "$output"; return 1; }
     [[ "$output" == *"SIGNAL RC=130 CANCEL=130"* ]] || { echo "$output"; return 1; }
     [[ "$(printf '%s\n' "$output" | grep -c 'BUILDX:')" -eq 1 ]]
@@ -1708,7 +1708,7 @@ clean_dev_docker
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Docker unused data · review with docker system df"* ]] || return 1
+    [[ "$output" == *"Docker unused data · review with docker system df -v"* ]] || return 1
     [[ "$output" != *"whitelisted"* ]] || return 1
     [[ "$output" != *"mo clean --whitelist"* ]] || return 1
     [[ "$output" != *"docker called"* ]]

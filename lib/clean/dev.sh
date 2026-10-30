@@ -1424,7 +1424,7 @@ find_orbstack_data_dir() {
 clean_dev_docker() {
     if command -v docker > /dev/null 2>&1; then
         note_activity
-        echo -e "  ${GRAY}${ICON_REVIEW}${NC} Docker unused data · review with docker system df"
+        echo -e "  ${GRAY}${ICON_REVIEW}${NC} Docker unused data · review with docker system df -v"
         debug_log "Docker daemon-managed cleanup skipped by default"
     fi
 
@@ -1445,7 +1445,7 @@ clean_dev_docker() {
         fi
         [[ -n "$orb_size" ]] && orb_size_label="$(bytes_to_human $((orb_size * 1024))) · "
         note_activity
-        echo -e "  ${GRAY}${ICON_REVIEW}${NC} OrbStack container data · ${orb_size_label}review with docker system df"
+        echo -e "  ${GRAY}${ICON_REVIEW}${NC} OrbStack container data · ${orb_size_label}review with docker system df -v"
         debug_log "OrbStack daemon-managed data left for manual prune ($orb_size KB)"
     fi
     safe_clean ~/.docker/buildx/cache/* "Docker BuildX cache"
